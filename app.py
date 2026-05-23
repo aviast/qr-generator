@@ -4,6 +4,7 @@ import csv
 import io
 import base64
 import os
+import re
 import threading
 import time
 import random
@@ -14,6 +15,7 @@ from datetime import datetime, timedelta
 # In-memory session store. For production you may want persistent storage.
 # session structure: {name: {email, code, start, expiry, csv_filename}}
 sessions = {}
+daily_creation_limits = {"ip": {}, "email": {}}
 sessions_lock = threading.Lock()
 
 SMTP_HOST = os.environ.get("SMTP_HOST")
@@ -22,10 +24,53 @@ SMTP_USER = os.environ.get("SMTP_USER")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", SMTP_USER)
 QR_BOX_SIZE = 23
+MAX_SESSIONS_PER_DAY = 20
+MAX_NAMES_PER_SESSION = 500
+UNKNOWN_IP_KEY = "unknown"
+SAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 def generate_code():
     return f"{random.randint(0,9999):04d}"
+
+
+def today_key():
+    return datetime.now().date().isoformat()
+
+
+def normalize_email(email: str):
+    return email.strip().lower()
+
+
+def safe_filename_part(value: str):
+    value = SAFE_FILENAME_CHARS.sub("_", value.strip())
+    return value.strip("._") or "session"
+
+
+def get_client_ip(page: ft.Page):
+    return (getattr(page, "client_ip", None) or UNKNOWN_IP_KEY).strip() or UNKNOWN_IP_KEY
+
+
+def check_creation_limit(limit_type: str, key: str, today: str):
+    record = daily_creation_limits[limit_type].get(key)
+    if not record or record["date"] != today:
+        record = {"date": today, "count": 0}
+        daily_creation_limits[limit_type][key] = record
+    if record["count"] >= MAX_SESSIONS_PER_DAY:
+        return False
+    return True
+
+
+def increment_creation_limit(limit_type: str, key: str):
+    daily_creation_limits[limit_type][key]["count"] += 1
+
+
+def cleanup_daily_limits():
+    today = today_key()
+    for limit_store in daily_creation_limits.values():
+        stale_keys = [key for key, record in limit_store.items() if record["date"] != today]
+        for key in stale_keys:
+            del limit_store[key]
 
 
 def send_email(to_email: str, subject: str, body: str, attachment_path: str = None):
@@ -63,26 +108,38 @@ def send_email(to_email: str, subject: str, body: str, attachment_path: str = No
         return False
 
 
-def create_session(session_name: str, email: str):
+def create_session(session_name: str, email: str, source_ip: str):
+    email = normalize_email(email)
+    source_ip = (source_ip or UNKNOWN_IP_KEY).strip() or UNKNOWN_IP_KEY
     with sessions_lock:
         if session_name in sessions:
             return False, "Session name already in use"
+        today = today_key()
+        if not check_creation_limit("ip", source_ip, today):
+            return False, "Daily session limit reached for this IP address"
+        if not check_creation_limit("email", email, today):
+            return False, "Daily session limit reached for this email address"
+
         code = generate_code()
         start = datetime.now()
         expiry = start + timedelta(hours=24)
-        csv_filename = start.strftime("%Y%m%d_%H%M%S_") + session_name + "_Headshot_Log.csv"
+        csv_filename = start.strftime("%Y%m%d_%H%M%S_") + safe_filename_part(session_name) + "_Headshot_Log.csv"
         # initialize CSV
         with open(csv_filename, mode='w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(["Timestamp", "Subject_Name"])
 
+        increment_creation_limit("ip", source_ip)
+        increment_creation_limit("email", email)
         sessions[session_name] = {
             "email": email,
+            "source_ip": source_ip,
             "code": code,
             "start": start,
             "expiry": expiry,
             "csv": csv_filename,
             "active": False,  # become active after code validation
+            "name_count": 0,
         }
 
     # send code email
@@ -126,11 +183,28 @@ def end_session(session_name: str):
     return True, "Session ended and data sent"
 
 
+def append_csv(session_name, person_name):
+    with sessions_lock:
+        s = sessions.get(session_name)
+        if not s:
+            return False, "Session not found"
+        if s.get("name_count", 0) >= MAX_NAMES_PER_SESSION:
+            return False, f"Session limit reached ({MAX_NAMES_PER_SESSION} names)"
+        csv_path = s["csv"]
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(csv_path, mode='a', newline='', encoding='utf-8') as file:
+            writer = csv.writer(file)
+            writer.writerow([timestamp, person_name])
+        s["name_count"] = s.get("name_count", 0) + 1
+    return True, "Name added"
+
+
 def expiry_worker():
     while True:
         now = datetime.now()
         to_end = []
         with sessions_lock:
+            cleanup_daily_limits()
             for name, s in list(sessions.items()):
                 if now > s["expiry"]:
                     to_end.append(name)
@@ -167,7 +241,7 @@ def main(page: ft.Page):
             create_msg.value = "Enter both session name and email"
             page.update()
             return
-        ok, msg = create_session(name, email)
+        ok, msg = create_session(name, email, get_client_ip(page))
         create_msg.value = msg
         page.update()
 
@@ -210,23 +284,18 @@ def main(page: ft.Page):
     name_input = ft.TextField(label="Please enter your name:", max_length=64, text_align=ft.TextAlign.CENTER, text_size=24, width=600, autofocus=True)
     qr_image = ft.Image(src="R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAIBRAA7", fit=ft.BoxFit.CONTAIN, expand=2)
     name_display = ft.Text(size=48, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER, expand=1)
-
-    def append_csv(session_name, person_name):
-        with sessions_lock:
-            s = sessions.get(session_name)
-            if not s:
-                return
-            csv_path = s["csv"]
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(csv_path, mode='a', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            writer.writerow([timestamp, person_name])
+    name_msg = ft.Text()
 
     def show_display(e):
         name = name_input.value.strip()
         if not name or not current_session["name"]:
             return
-        append_csv(current_session["name"], name)
+        ok, msg = append_csv(current_session["name"], name)
+        if not ok:
+            name_msg.value = msg
+            page.update()
+            return
+        name_msg.value = ""
 
         qr = qrcode.QRCode(version=5, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=QR_BOX_SIZE, border=4)
         qr.add_data(name)
@@ -270,6 +339,7 @@ def main(page: ft.Page):
         content=ft.Column(
             controls=[
                 name_input,
+                name_msg,
                 ft.Row(controls=[ft.OutlinedButton("Reset", on_click=lambda e: (name_input.__setattr__('value',''), page.update())), ft.Button("Display", on_click=show_display)], alignment=ft.MainAxisAlignment.CENTER, spacing=50)
             ],
             alignment=ft.MainAxisAlignment.CENTER,
@@ -299,12 +369,18 @@ def main(page: ft.Page):
         name_input_local = ft.TextField(label="Please enter your name:", max_length=64, text_align=ft.TextAlign.CENTER, text_size=24, width=600, autofocus=True)
         qr_image_local = ft.Image(src="R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAIBRAA7", fit=ft.BoxFit.CONTAIN, expand=2)
         name_display_local = ft.Text(size=48, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER, expand=1)
+        name_msg_local = ft.Text()
 
         def show_display_local(e):
             name = name_input_local.value.strip()
             if not name or not current_session["name"]:
                 return
-            append_csv(current_session["name"], name)
+            ok, msg = append_csv(current_session["name"], name)
+            if not ok:
+                name_msg_local.value = msg
+                page.update()
+                return
+            name_msg_local.value = ""
             qr = qrcode.QRCode(version=5, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=QR_BOX_SIZE, border=4)
             qr.add_data(name)
             qr.make(fit=True)
@@ -327,6 +403,7 @@ def main(page: ft.Page):
             content=ft.Column(
                 controls=[
                     name_input_local,
+                    name_msg_local,
                     ft.Row(controls=[ft.OutlinedButton("Reset", on_click=lambda e: (name_input_local.__setattr__('value',''), page.update())), ft.Button("Display", on_click=show_display_local)], alignment=ft.MainAxisAlignment.CENTER, spacing=50)
                 ],
                 alignment=ft.MainAxisAlignment.CENTER,
