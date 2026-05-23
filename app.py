@@ -26,6 +26,9 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", SMTP_USER)
 QR_BOX_SIZE = 23
 MAX_SESSIONS_PER_DAY = 20
 MAX_NAMES_PER_SESSION = 500
+MAX_PRELOADED_NAMES = 5000
+MAX_NAME_FILE_BYTES = 256 * 1024
+MAX_VISIBLE_SUGGESTIONS = 8
 UNKNOWN_IP_KEY = "unknown"
 SAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -71,6 +74,62 @@ def cleanup_daily_limits():
         stale_keys = [key for key, record in limit_store.items() if record["date"] != today]
         for key in stale_keys:
             del limit_store[key]
+
+
+def parse_name_file(file_name: str, data: bytes):
+    if not data:
+        return False, "Selected file is empty", []
+    if len(data) > MAX_NAME_FILE_BYTES:
+        return False, "Name file is too large", []
+
+    text = data.decode("utf-8-sig", errors="replace")
+    names = []
+    seen = set()
+    for line in text.splitlines():
+        name = line.strip()
+        if not name:
+            continue
+        dedupe_key = name.casefold()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        names.append(name[:64])
+        if len(names) >= MAX_PRELOADED_NAMES:
+            break
+
+    if not names:
+        return False, f"No names found in {file_name}", []
+    return True, f"Loaded {len(names)} names", names
+
+
+def set_preloaded_names(session_name: str, names: list[str]):
+    with sessions_lock:
+        s = sessions.get(session_name)
+        if not s:
+            return False, "Session not found"
+        s["preloaded_names"] = names
+    return True, f"Loaded {len(names)} names"
+
+
+def get_preloaded_names(session_name: str):
+    with sessions_lock:
+        s = sessions.get(session_name)
+        if not s:
+            return []
+        return list(s.get("preloaded_names", []))
+
+
+def find_name_matches(session_name: str, prefix: str):
+    prefix = prefix.strip().casefold()
+    if not prefix:
+        return []
+    matches = []
+    for name in get_preloaded_names(session_name):
+        if name.casefold().startswith(prefix):
+            matches.append(name)
+            if len(matches) >= MAX_VISIBLE_SUGGESTIONS:
+                break
+    return matches
 
 
 def send_email(to_email: str, subject: str, body: str, attachment_path: str = None):
@@ -140,6 +199,7 @@ def create_session(session_name: str, email: str, source_ip: str):
             "csv": csv_filename,
             "active": False,  # become active after code validation
             "name_count": 0,
+            "preloaded_names": [],
         }
 
     # send code email
@@ -323,16 +383,19 @@ def main(page: ft.Page):
         ok, msg = end_session(name)
         # return to session selection
         current_session["name"] = None
+        page.on_keyboard_event = None
         page.appbar = None
         page.controls.clear()
         page.add(session_view)
         page.update()
 
-    def make_menu_button():
+    def make_menu_button(upload_handler=None):
+        items = []
+        if upload_handler:
+            items.append(ft.PopupMenuItem(content="Upload name list", on_click=upload_handler))
+        items.append(ft.PopupMenuItem(content="End session", on_click=on_end_session))
         return ft.PopupMenuButton(
-            items=[
-                ft.PopupMenuItem(content="End session", on_click=on_end_session),
-            ],
+            items=items,
         )
 
     input_view = ft.Container(
@@ -370,6 +433,77 @@ def main(page: ft.Page):
         qr_image_local = ft.Image(src="R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAIBRAA7", fit=ft.BoxFit.CONTAIN, expand=2)
         name_display_local = ft.Text(size=48, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER, expand=1)
         name_msg_local = ft.Text()
+        upload_msg_local = ft.Text()
+        current_matches = []
+
+        def select_suggestion(name):
+            name_input_local.value = name
+            suggestions_container.visible = False
+            suggestions_column.controls.clear()
+            name_input_local.focus()
+            page.update()
+
+        def make_suggestion(name):
+            return ft.Container(
+                content=ft.Text(name, size=18),
+                padding=ft.Padding(left=14, top=8, right=14, bottom=8),
+                width=600,
+                bgcolor=ft.Colors.WHITE,
+                border=ft.Border(bottom=ft.BorderSide(1, ft.Colors.GREY_200)),
+                on_click=lambda e, selected=name: select_suggestion(selected),
+            )
+
+        def update_suggestions(e=None):
+            nonlocal current_matches
+            session_name = current_session.get("name")
+            current_matches = find_name_matches(session_name, name_input_local.value) if session_name else []
+            suggestions_column.controls = [make_suggestion(match) for match in current_matches]
+            suggestions_container.visible = bool(current_matches)
+            page.update()
+
+        name_input_local.on_change = update_suggestions
+
+        suggestions_column = ft.Column(spacing=0, width=600)
+        suggestions_container = ft.Container(
+            content=suggestions_column,
+            width=600,
+            visible=False,
+            border=ft.Border(
+                top=ft.BorderSide(1, ft.Colors.GREY_300),
+                right=ft.BorderSide(1, ft.Colors.GREY_300),
+                bottom=ft.BorderSide(1, ft.Colors.GREY_300),
+                left=ft.BorderSide(1, ft.Colors.GREY_300),
+            ),
+            border_radius=4,
+        )
+
+        async def upload_name_list(e):
+            session_name = current_session.get("name")
+            if not session_name:
+                return
+            files = await ft.FilePicker().pick_files(
+                allow_multiple=False,
+                with_data=True,
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["txt"],
+            )
+            if not files:
+                upload_msg_local.value = "Name upload cancelled"
+                page.update()
+                return
+
+            selected = files[0]
+            ok, msg, names = parse_name_file(selected.name, selected.bytes)
+            if ok:
+                ok, msg = set_preloaded_names(session_name, names)
+            upload_msg_local.value = msg
+            update_suggestions()
+
+        def on_keyboard(e: ft.KeyboardEvent):
+            if e.key == "Tab" and input_view_local.visible and len(current_matches) == 1:
+                select_suggestion(current_matches[0])
+
+        page.on_keyboard_event = on_keyboard
 
         def show_display_local(e):
             name = name_input_local.value.strip()
@@ -403,7 +537,9 @@ def main(page: ft.Page):
             content=ft.Column(
                 controls=[
                     name_input_local,
+                    suggestions_container,
                     name_msg_local,
+                    upload_msg_local,
                     ft.Row(controls=[ft.OutlinedButton("Reset", on_click=lambda e: (name_input_local.__setattr__('value',''), page.update())), ft.Button("Display", on_click=show_display_local)], alignment=ft.MainAxisAlignment.CENTER, spacing=50)
                 ],
                 alignment=ft.MainAxisAlignment.CENTER,
@@ -427,7 +563,7 @@ def main(page: ft.Page):
         )
 
         page.appbar = ft.AppBar(
-            leading=make_menu_button(),
+            leading=make_menu_button(upload_name_list),
             title=ft.Text(f"Session: {current_session['name']}"),
         )
         page.controls.clear()
