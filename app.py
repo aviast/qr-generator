@@ -184,7 +184,7 @@ def create_session(session_name: str, email: str, source_ip: str):
         csv_filename = start.strftime("%Y%m%d_%H%M%S_") + safe_filename_part(session_name) + "_Headshot_Log.csv"
 
         # initialize in-memory CSV data
-        csv_data = [["Timestamp", "Subject_Name"]]
+        csv_data = [["Timestamp", "Subject_Name", "Email", "Phone"]]
 
         increment_creation_limit("ip", source_ip)
         increment_creation_limit("email", email)
@@ -247,7 +247,7 @@ def end_session(session_name: str):
     return True, "Session ended and data sent"
 
 
-def append_csv(session_name, person_name):
+def append_csv(session_name, person_name, email="", phone=""):
     with sessions_lock:
         s = sessions.get(session_name)
         if not s:
@@ -256,7 +256,7 @@ def append_csv(session_name, person_name):
             return False, f"Session limit reached ({MAX_NAMES_PER_SESSION} names)"
 
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        s["csv_data"].append([timestamp, person_name])
+        s["csv_data"].append([timestamp, person_name, email, phone])
         s["name_count"] = s.get("name_count", 0) + 1
     return True, "Name added"
 
@@ -343,7 +343,7 @@ def main(page: ft.Page):
     )
 
     # --- Main input/display UI (per-session) ---
-    name_input = ft.TextField(label="Please enter your name:", max_length=64, text_align=ft.TextAlign.CENTER, text_size=24, width=600, autofocus=True)
+    name_input = ft.TextField(label="Please enter your full name:", max_length=64, text_align=ft.TextAlign.CENTER, text_size=24, width=600, autofocus=True)
     qr_image = ft.Image(src="R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAIBRAA7", fit=ft.BoxFit.CONTAIN, expand=2)
     name_display = ft.Text(size=48, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER, expand=1)
     name_msg = ft.Text()
@@ -391,15 +391,6 @@ def main(page: ft.Page):
         page.add(session_view)
         page.update()
 
-    def make_menu_button(upload_handler=None):
-        items = []
-        if upload_handler:
-            items.append(ft.PopupMenuItem(content="Upload name list", on_click=upload_handler))
-        items.append(ft.PopupMenuItem(content="End session", on_click=on_end_session))
-        return ft.PopupMenuButton(
-            items=items,
-        )
-
     input_view = ft.Container(
         content=ft.Column(
             controls=[
@@ -431,10 +422,12 @@ def main(page: ft.Page):
         print("show_main_view: preparing main UI for session", current_session.get("name"))
 
         # Build fresh UI controls to avoid stale layout issues
-        name_input_local = ft.TextField(label="Please enter your name:", max_length=64, text_align=ft.TextAlign.CENTER, text_size=24, width=600, autofocus=True)
+        name_input_local = ft.TextField(label="Please enter your full name:", max_length=64, text_align=ft.TextAlign.CENTER, text_size=24, width=600, autofocus=True)
         qr_image_local = ft.Image(src="R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAIBRAA7", fit=ft.BoxFit.CONTAIN, expand=2)
         name_display_local = ft.Text(size=48, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER, expand=1)
         name_msg_local = ft.Text()
+        email_input_local = ft.TextField(label="Please enter your email address:", max_length=128, text_align=ft.TextAlign.CENTER, text_size=24, width=600, visible=False)
+        phone_input_local = ft.TextField(label="Please enter your mobile phone number:", max_length=32, text_align=ft.TextAlign.CENTER, text_size=24, width=600, visible=False)
         upload_msg_local = ft.Text()
         current_matches = []
 
@@ -514,14 +507,21 @@ def main(page: ft.Page):
 
         def show_display_local(e):
             name = name_input_local.value.strip()
+            # Only grab email/phone values if their fields are currently visible
+            email = email_input_local.value.strip() if email_input_local.visible else ""
+            phone = phone_input_local.value.strip() if phone_input_local.visible else ""
+
             if not name or not current_session["name"]:
                 return
-            ok, msg = append_csv(current_session["name"], name)
+
+            ok, msg = append_csv(current_session["name"], name, email, phone)
             if not ok:
                 name_msg_local.value = msg
                 page.update()
                 return
             name_msg_local.value = ""
+
+            # QR code generation (using ONLY the name, as requested)
             qr = qrcode.QRCode(version=5, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=QR_BOX_SIZE, border=4)
             qr.add_data(name)
             qr.make(fit=True)
@@ -529,10 +529,17 @@ def main(page: ft.Page):
             buffer = io.BytesIO()
             img.save(buffer, format="PNG")
             qr_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
             qr_image_local.src = qr_base64
             name_display_local.value = name
             input_view_local.visible = False
             display_view_local.visible = True
+            page.update()
+
+        def reset_inputs(e):
+            name_input_local.value = ""
+            email_input_local.value = ""
+            phone_input_local.value = ""
             page.update()
 
         def show_input_local(e):
@@ -545,9 +552,18 @@ def main(page: ft.Page):
                 controls=[
                     name_input_local,
                     suggestions_container,
+                    email_input_local,
+                    phone_input_local,
                     name_msg_local,
                     upload_msg_local,
-                    ft.Row(controls=[ft.OutlinedButton("Reset", on_click=lambda e: (name_input_local.__setattr__('value',''), page.update())), ft.Button("Display", on_click=show_display_local)], alignment=ft.MainAxisAlignment.CENTER, spacing=50)
+                    ft.Row(
+                        controls=[
+                            ft.OutlinedButton("Reset", on_click=reset_inputs),
+                            ft.Button("Display", on_click=show_display_local)
+                        ],
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        spacing=50
+                    )
                 ],
                 alignment=ft.MainAxisAlignment.CENTER,
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER
@@ -569,10 +585,33 @@ def main(page: ft.Page):
             on_click=show_input_local
         )
 
+        def toggle_email(e):
+            email_menu.checked = not email_menu.checked
+            email_input_local.visible = email_menu.checked
+            page.update()
+
+        def toggle_phone(e):
+            phone_menu.checked = not phone_menu.checked
+            phone_input_local.visible = phone_menu.checked
+            page.update()
+
+        # Flet popup menus support a 'checked' parameter which handles the checkbox UI natively!
+        # Use 'content' instead of 'text' for the Flet PopupMenuItem
+        email_menu = ft.PopupMenuItem(content="Input for email address", checked=False, on_click=toggle_email)
+        phone_menu = ft.PopupMenuItem(content="Input for mobile phone", checked=False, on_click=toggle_phone)
+
         page.appbar = ft.AppBar(
-            leading=make_menu_button(upload_name_list),
+            leading=ft.PopupMenuButton(
+                items=[
+                    ft.PopupMenuItem(content="Upload name list", on_click=upload_name_list),
+                    email_menu,
+                    phone_menu,
+                    ft.PopupMenuItem(content="End session", on_click=on_end_session)
+                ]
+            ),
             title=ft.Text(f"Session: {current_session['name']}"),
         )
+
         page.controls.clear()
         page.add(input_view_local, display_view_local)
         page.update()
