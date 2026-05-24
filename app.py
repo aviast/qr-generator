@@ -53,9 +53,10 @@ def init_db():
                             start TEXT,
                             expiry TEXT,
                             active INTEGER,
-                            status TEXT
+                            status TEXT,
+                            ask_email INTEGER DEFAULT 0,
+                            ask_phone INTEGER DEFAULT 0
                         )''')
-            # Changed session_name to session_id
             c.execute('''CREATE TABLE IF NOT EXISTS entries (
                             id INTEGER PRIMARY KEY AUTOINCREMENT,
                             session_id INTEGER,
@@ -66,7 +67,6 @@ def init_db():
                             ip_address TEXT,
                             device_id TEXT
                         )''')
-            # Changed session_name to session_id
             c.execute('''CREATE TABLE IF NOT EXISTS preloaded_names (
                             session_id INTEGER,
                             name TEXT
@@ -232,8 +232,8 @@ def create_session(session_name: str, email: str, source_ip: str):
     with db_lock:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
-            c.execute('''INSERT INTO sessions (name, email, source_ip, code, start, expiry, active, status)
-                         VALUES (?, ?, ?, ?, ?, ?, 0, 'active')''',
+            c.execute('''INSERT INTO sessions (name, email, source_ip, code, start, expiry, active, status, ask_email, ask_phone)
+                         VALUES (?, ?, ?, ?, ?, ?, 0, 'active', 0, 0)''',
                          (session_name, email, source_ip, code, start_dt.isoformat(), expiry_dt.isoformat()))
             conn.commit()
 
@@ -249,22 +249,27 @@ def validate_session_code(session_name: str, code: str):
     with db_lock:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
-            # Fetch the 'id' along with code and expiry
-            c.execute("SELECT id, code, expiry FROM sessions WHERE name=? AND status != 'deleted'", (session_name,))
+            c.execute("SELECT id, code, expiry, ask_email, ask_phone FROM sessions WHERE name=? AND status != 'deleted'", (session_name,))
             row = c.fetchone()
             if not row:
-                return False, "Session not found or has been deleted", None
+                return False, "Session not found or has been deleted", None, None, False, False
 
-            session_id, db_code, expiry_str = row
+            session_id, db_code, expiry_str, ask_email, ask_phone = row
             if db_code != code:
-                return False, "Invalid code", None
+                return False, "Invalid code", None, None, False, False
             if datetime.now() > datetime.fromisoformat(expiry_str):
-                return False, "Session expired", None
+                return False, "Session expired", None, None, False, False
 
             c.execute("UPDATE sessions SET active=1 WHERE id=?", (session_id,))
             conn.commit()
-    # Return the session_id so the UI can hold onto it
-    return True, "Session active", session_id
+    return True, "Session active", session_id, db_code, bool(ask_email), bool(ask_phone)
+
+def save_session_settings(session_id: int, ask_email: bool, ask_phone: bool):
+    with db_lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("UPDATE sessions SET ask_email=?, ask_phone=? WHERE id=?", (int(ask_email), int(ask_phone), session_id))
+            conn.commit()
 
 def end_session(session_id: int):
     with db_lock:
@@ -345,7 +350,7 @@ def expiry_worker():
 
 # --- Flet UI Main ---
 async def main(page: ft.Page):
-    page.title = "Headshot QR Generator - Sessions"
+    page.title = "Headshot QR Generator"
     page.theme_mode = ft.ThemeMode.LIGHT
     page.padding = 0
     page.window_maximized = True
@@ -357,9 +362,12 @@ async def main(page: ft.Page):
         await prefs.set("device_id", device_id)
 
     client_ip = get_client_ip(page)
-    current_session = {"id": None, "name": None}
+    # Added "code", "ask_email", and "ask_phone" to local state
+    current_session = {"id": None, "name": None, "code": None, "ask_email": False, "ask_phone": False}
 
-    # --- Session creation/access UI ---
+    # ==========================================
+    # VIEW 1: SESSION LOGIN / CREATION
+    # ==========================================
     session_name_input = ft.TextField(label="Session name (unique)")
     session_email_input = ft.TextField(label="Email address")
     create_msg = ft.Text()
@@ -382,13 +390,16 @@ async def main(page: ft.Page):
     def on_access(e):
         name = access_name_input.value.strip()
         code = access_code_input.value.strip()
-        ok, msg, session_id = validate_session_code(name, code)
+        ok, msg, session_id, db_code, ask_email, ask_phone = validate_session_code(name, code)
         access_msg.value = msg
         page.update()
         if ok:
             current_session["id"] = session_id
             current_session["name"] = name
-            show_main_view()
+            current_session["code"] = db_code
+            current_session["ask_email"] = ask_email
+            current_session["ask_phone"] = ask_phone
+            show_admin_view() # Route directly to Admin View first!
 
     create_button = ft.Button("Create session", on_click=on_create)
     access_button = ft.Button("Access session", on_click=on_access)
@@ -412,29 +423,128 @@ async def main(page: ft.Page):
         expand=True,
     )
 
-    def on_end_session(e):
-        id = current_session.get("id")
-        if not id:
-            return
-        ok, msg = end_session(id)
-        current_session["id"] = None
-        page.on_keyboard_event = None
+    # ==========================================
+    # VIEW 2: SESSION ADMINISTRATION
+    # ==========================================
+    def show_admin_view():
         page.appbar = None
+
+        email_checkbox = ft.Checkbox(label="Prompt subjects for Email Address", value=current_session["ask_email"])
+        phone_checkbox = ft.Checkbox(label="Prompt subjects for Mobile Phone", value=current_session["ask_phone"])
+        upload_msg_local = ft.Text()
+
+        async def upload_name_list(e):
+            files = await ft.FilePicker().pick_files(
+                allow_multiple=False,
+                with_data=True,
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["txt"],
+            )
+            if not files:
+                upload_msg_local.value = "Name upload cancelled"
+                page.update()
+                return
+
+            selected = files[0]
+            ok, msg, names = parse_name_file(selected.name, selected.bytes)
+            if ok:
+                ok, msg = set_preloaded_names(current_session["id"], names)
+            upload_msg_local.value = msg
+            page.update()
+
+        def on_end_session(e):
+            end_session(current_session["id"])
+            current_session["id"] = None
+            page.controls.clear()
+            page.add(session_view)
+            page.update()
+
+        def on_to_app(e):
+            # Save settings to DB and update local state
+            current_session["ask_email"] = email_checkbox.value
+            current_session["ask_phone"] = phone_checkbox.value
+            save_session_settings(current_session["id"], email_checkbox.value, phone_checkbox.value)
+            show_main_view()
+
+        admin_view = ft.Container(
+            content=ft.Column(
+                controls=[
+                    ft.Text(f"Administration: {current_session['name']}", size=32, weight=ft.FontWeight.BOLD),
+                    ft.Divider(height=40),
+                    ft.Text("Session Settings", size=20),
+                    email_checkbox,
+                    phone_checkbox,
+                    ft.Divider(height=40),
+                    ft.Text("Data Management", size=20),
+                    ft.OutlinedButton("Upload Name List (.txt)", on_click=upload_name_list),
+                    upload_msg_local,
+                    ft.OutlinedButton("End & Delete Session", on_click=on_end_session, icon=ft.Icons.WARNING, icon_color="red"),
+                    ft.Divider(height=40),
+                    ft.FilledButton("To the App...", on_click=on_to_app, icon=ft.Icons.ARROW_FORWARD, width=200, height=50)
+                ],
+                alignment=ft.MainAxisAlignment.CENTER,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER
+            ),
+            alignment=ft.Alignment.CENTER,
+            expand=True
+        )
+
         page.controls.clear()
-        page.add(session_view)
+        page.add(admin_view)
         page.update()
 
+
+    # ==========================================
+    # VIEW 3: MAIN QR GENERATOR
+    # ==========================================
     def show_main_view():
         name_input_local = ft.TextField(label="Please enter your full name:", max_length=64, text_align=ft.TextAlign.CENTER, text_size=24, width=600, autofocus=True)
-        email_input_local = ft.TextField(label="Please enter your email address:", max_length=128, text_align=ft.TextAlign.CENTER, text_size=24, width=600, visible=False)
-        phone_input_local = ft.TextField(label="Please enter your mobile phone number:", max_length=32, text_align=ft.TextAlign.CENTER, text_size=24, width=600, visible=False)
+        # Visibility tied directly to the admin settings
+        email_input_local = ft.TextField(label="Please enter your email address:", max_length=128, text_align=ft.TextAlign.CENTER, text_size=24, width=600, visible=current_session["ask_email"])
+        phone_input_local = ft.TextField(label="Please enter your mobile phone number:", max_length=32, text_align=ft.TextAlign.CENTER, text_size=24, width=600, visible=current_session["ask_phone"])
 
         qr_image_local = ft.Image(src="R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAIBRAA7", fit=ft.BoxFit.CONTAIN, expand=2)
         name_display_local = ft.Text(size=48, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER, expand=1)
         name_msg_local = ft.Text()
-        upload_msg_local = ft.Text()
         current_matches = []
 
+        # --- The PIN Security Dialog ---
+        pin_input = ft.TextField(label="4-digit PIN", password=True, width=150, text_align=ft.TextAlign.CENTER, autofocus=True)
+        pin_error = ft.Text(color=ft.Colors.RED)
+
+        def verify_pin(e):
+            if pin_input.value.strip() == current_session["code"]:
+                page.pop_dialog() # pin_dialog
+                show_admin_view()
+            else:
+                pin_error.value = "Invalid PIN"
+                page.update()
+
+        pin_dialog = ft.AlertDialog(
+            title=ft.Text("Admin Access"),
+            content=ft.Column([ft.Text("Enter your session PIN:"), pin_input, pin_error], tight=True),
+            actions=[
+                # Modern way to close on cancel
+                ft.TextButton("Cancel", on_click=lambda e: page.pop_dialog()), #pin_dialog
+                ft.TextButton("Enter", on_click=verify_pin)
+            ]
+        )
+
+        def open_admin_dialog(e):
+            pin_input.value = ""
+            pin_error.value = ""
+            page.show_dialog(pin_dialog)
+
+        page.appbar = ft.AppBar(
+            leading=ft.PopupMenuButton(
+                items=[
+                    ft.PopupMenuItem(content=ft.Text("Session Administration"), on_click=open_admin_dialog),
+                ]
+            ),
+            title=ft.Text(f"Session: {current_session['name']}"),
+        )
+
+        # --- QR Logic ---
         async def select_suggestion(name):
             name_input_local.value = name
             suggestions_container.visible = False
@@ -478,28 +588,6 @@ async def main(page: ft.Page):
             ),
             border_radius=4,
         )
-
-        async def upload_name_list(e):
-            session_id = current_session.get("id")
-            if not session_id:
-                return
-            files = await ft.FilePicker().pick_files(
-                allow_multiple=False,
-                with_data=True,
-                file_type=ft.FilePickerFileType.CUSTOM,
-                allowed_extensions=["txt"],
-            )
-            if not files:
-                upload_msg_local.value = "Name upload cancelled"
-                page.update()
-                return
-
-            selected = files[0]
-            ok, msg, names = parse_name_file(selected.name, selected.bytes)
-            if ok:
-                ok, msg = set_preloaded_names(session_id, names)
-            upload_msg_local.value = msg
-            update_suggestions()
 
         async def on_keyboard(e: ft.KeyboardEvent):
             if e.key == "Tab" and input_view_local.visible and len(current_matches) == 1:
@@ -561,7 +649,6 @@ async def main(page: ft.Page):
                     email_input_local,
                     phone_input_local,
                     name_msg_local,
-                    upload_msg_local,
                     ft.Row(
                         controls=[
                             ft.OutlinedButton("Reset", on_click=reset_inputs),
@@ -591,35 +678,11 @@ async def main(page: ft.Page):
             on_click=show_input_local
         )
 
-        def toggle_email(e):
-            email_menu.checked = not email_menu.checked
-            email_input_local.visible = email_menu.checked
-            page.update()
-
-        def toggle_phone(e):
-            phone_menu.checked = not phone_menu.checked
-            phone_input_local.visible = phone_menu.checked
-            page.update()
-
-        email_menu = ft.PopupMenuItem(content=ft.Text("Input email address"), checked=False, on_click=toggle_email)
-        phone_menu = ft.PopupMenuItem(content=ft.Text("Input mobile phone number"), checked=False, on_click=toggle_phone)
-
-        page.appbar = ft.AppBar(
-            leading=ft.PopupMenuButton(
-                items=[
-                    ft.PopupMenuItem(content=ft.Text("Upload name list"), on_click=upload_name_list),
-                    email_menu,
-                    phone_menu,
-                    ft.PopupMenuItem(content=ft.Text("End session"), on_click=on_end_session)
-                ]
-            ),
-            title=ft.Text(f"Session: {current_session['name']}"),
-        )
-
         page.controls.clear()
         page.add(input_view_local, display_view_local)
         page.update()
 
+    # App Start
     page.add(session_view)
 
 if __name__ == "__main__":
