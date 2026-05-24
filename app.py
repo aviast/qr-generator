@@ -30,6 +30,9 @@ MAX_NAME_FILE_BYTES = 256 * 1024
 MAX_VISIBLE_SUGGESTIONS = 8
 UNKNOWN_IP_KEY = "unknown"
 SAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
+FONT_ROBOTO = "Roboto"
+FONT_ROBOTO_LIGHT = "RobotoLight"
+FONT_ROBOTO_MEDIUM = "RobotoMedium"
 
 # --- Database Initialization ---
 STORAGE_DIR = os.environ.get("FLET_APP_STORAGE_DATA", ".")
@@ -351,6 +354,12 @@ def expiry_worker():
 # --- Flet UI Main ---
 async def main(page: ft.Page):
     page.title = "Headshot QR Generator"
+    page.fonts = {
+        FONT_ROBOTO_LIGHT: "Roboto-Light.ttf",
+        FONT_ROBOTO: "Roboto-Regular.ttf",
+        FONT_ROBOTO_MEDIUM: "Roboto-Medium.ttf",
+    }
+    page.theme = ft.Theme(font_family=FONT_ROBOTO)
     page.theme_mode = ft.ThemeMode.LIGHT
     page.padding = 0
     page.window_maximized = True
@@ -504,7 +513,7 @@ async def main(page: ft.Page):
         phone_input_local = ft.TextField(label="Please enter your mobile phone number:", max_length=32, text_align=ft.TextAlign.CENTER, text_size=24, width=600, visible=current_session["ask_phone"])
 
         qr_image_local = ft.Image(src="R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAIBRAA7", fit=ft.BoxFit.CONTAIN, expand=2)
-        name_display_local = ft.Text(size=48, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER, expand=1)
+        name_display_local = ft.Text(size=60, font_family=FONT_ROBOTO_MEDIUM, text_align=ft.TextAlign.CENTER, expand=1)
         name_msg_local = ft.Text()
         current_matches = []
 
@@ -688,4 +697,4 @@ async def main(page: ft.Page):
 if __name__ == "__main__":
     t = threading.Thread(target=expiry_worker, daemon=True)
     t.start()
-    ft.run(main=main, view=ft.AppView.WEB_BROWSER, host="0.0.0.0", port=8080)
+    ft.run(main=main, view=ft.AppView.WEB_BROWSER, host="0.0.0.0", port=8080, assets_dir="Roboto")
