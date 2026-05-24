@@ -1,0 +1,9 @@
+.git
+.vscode
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+headshots.db
+*.csv

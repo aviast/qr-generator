@@ -1,0 +1,2 @@
+flet[web]
+qrcode[pil]

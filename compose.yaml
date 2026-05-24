@@ -1,0 +1,19 @@
+services:
+  qr-generator:
+    build: .
+    container_name: qr-generator
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      FLET_APP_STORAGE_DATA: /data
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      FROM_EMAIL: ${FROM_EMAIL:-}
+    volumes:
+      - qr-generator-data:/data
+
+volumes:
+  qr-generator-data:
