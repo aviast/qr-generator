@@ -13,7 +13,7 @@ from email.message import EmailMessage
 from datetime import datetime, timedelta
 
 # In-memory session store. For production you may want persistent storage.
-# session structure: {name: {email, code, start, expiry, csv_filename}}
+# session structure: {name: {email, code, start, expiry, csv_filename, csv_data, ...}}
 sessions = {}
 daily_creation_limits = {"ip": {}, "email": {}}
 sessions_lock = threading.Lock()
@@ -132,16 +132,17 @@ def find_name_matches(session_name: str, prefix: str):
     return matches
 
 
-def send_email(to_email: str, subject: str, body: str, attachment_path: str = None):
-    """Send email via SMTP if configured; otherwise log to console and
-    leave the attachment on disk."""
+def send_email(to_email: str, subject: str, body: str, attachment_bytes: bytes = None, attachment_filename: str = None):
+    """
+    Send email via SMTP if configured; otherwise log to console.
+    """
     print(f"Preparing to send email to {to_email}: {subject}")
     if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
         print("SMTP not configured. Email not sent. Install SMTP env vars to enable email.")
         print("Subject:", subject)
         print("Body:\n", body)
-        if attachment_path:
-            print("Attachment path:", attachment_path)
+        if attachment_filename:
+            print(f"Attachment ({attachment_filename}): [in-memory CSV data present]")
         return False
 
     msg = EmailMessage()
@@ -150,10 +151,8 @@ def send_email(to_email: str, subject: str, body: str, attachment_path: str = No
     msg["To"] = to_email
     msg.set_content(body)
 
-    if attachment_path and os.path.exists(attachment_path):
-        with open(attachment_path, "rb") as f:
-            data = f.read()
-        msg.add_attachment(data, maintype="text", subtype="csv", filename=os.path.basename(attachment_path))
+    if attachment_bytes and attachment_filename:
+        msg.add_attachment(attachment_bytes, maintype="text", subtype="csv", filename=attachment_filename)
 
     try:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
@@ -183,10 +182,9 @@ def create_session(session_name: str, email: str, source_ip: str):
         start = datetime.now()
         expiry = start + timedelta(hours=24)
         csv_filename = start.strftime("%Y%m%d_%H%M%S_") + safe_filename_part(session_name) + "_Headshot_Log.csv"
-        # initialize CSV
-        with open(csv_filename, mode='w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(["Timestamp", "Subject_Name"])
+
+        # initialize in-memory CSV data
+        csv_data = [["Timestamp", "Subject_Name"]]
 
         increment_creation_limit("ip", source_ip)
         increment_creation_limit("email", email)
@@ -196,7 +194,8 @@ def create_session(session_name: str, email: str, source_ip: str):
             "code": code,
             "start": start,
             "expiry": expiry,
-            "csv": csv_filename,
+            "csv_filename": csv_filename,
+            "csv_data": csv_data,
             "active": False,  # become active after code validation
             "name_count": 0,
             "preloaded_names": [],
@@ -227,18 +226,23 @@ def end_session(session_name: str):
         s = sessions.get(session_name)
         if not s:
             return False, "Session not found"
-        csv_path = s.get("csv")
+
         email = s.get("email")
+        csv_filename = s.get("csv_filename")
+        csv_data = s.get("csv_data", [])
+
+        # Convert in-memory list to CSV bytes
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerows(csv_data)
+        attachment_bytes = output.getvalue().encode("utf-8")
+
         # send CSV
         subject = f"Session '{session_name}' results"
         body = f"Attached is the CSV for session '{session_name}' which ended at {datetime.now().isoformat()}"
-        send_email(email, subject, body, attachment_path=csv_path)
-        # delete CSV file and session
-        try:
-            if csv_path and os.path.exists(csv_path):
-                os.remove(csv_path)
-        except Exception as ex:
-            print("Failed to delete CSV:", ex)
+        send_email(email, subject, body, attachment_bytes=attachment_bytes, attachment_filename=csv_filename)
+
+        # remove session from memory
         del sessions[session_name]
     return True, "Session ended and data sent"
 
@@ -250,11 +254,9 @@ def append_csv(session_name, person_name):
             return False, "Session not found"
         if s.get("name_count", 0) >= MAX_NAMES_PER_SESSION:
             return False, f"Session limit reached ({MAX_NAMES_PER_SESSION} names)"
-        csv_path = s["csv"]
+
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(csv_path, mode='a', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            writer.writerow([timestamp, person_name])
+        s["csv_data"].append([timestamp, person_name])
         s["name_count"] = s.get("name_count", 0) + 1
     return True, "Name added"
 
@@ -436,21 +438,26 @@ def main(page: ft.Page):
         upload_msg_local = ft.Text()
         current_matches = []
 
-        def select_suggestion(name):
+        async def select_suggestion(name):
             name_input_local.value = name
             suggestions_container.visible = False
             suggestions_column.controls.clear()
-            name_input_local.focus()
+            await name_input_local.focus()
             page.update()
 
         def make_suggestion(name):
+            # Use an inner async function to properly await the selection
+            # and avoid late-binding issues from a lambda.
+            async def handle_click(e):
+                await select_suggestion(name)
+
             return ft.Container(
                 content=ft.Text(name, size=18),
                 padding=ft.Padding(left=14, top=8, right=14, bottom=8),
                 width=600,
                 bgcolor=ft.Colors.WHITE,
                 border=ft.Border(bottom=ft.BorderSide(1, ft.Colors.GREY_200)),
-                on_click=lambda e, selected=name: select_suggestion(selected),
+                on_click=handle_click,
             )
 
         def update_suggestions(e=None):
@@ -499,9 +506,9 @@ def main(page: ft.Page):
             upload_msg_local.value = msg
             update_suggestions()
 
-        def on_keyboard(e: ft.KeyboardEvent):
+        async def on_keyboard(e: ft.KeyboardEvent):
             if e.key == "Tab" and input_view_local.visible and len(current_matches) == 1:
-                select_suggestion(current_matches[0])
+                await select_suggestion(current_matches[0])
 
         page.on_keyboard_event = on_keyboard
 
@@ -579,4 +586,4 @@ if __name__ == "__main__":
     # start expiry thread
     t = threading.Thread(target=expiry_worker, daemon=True)
     t.start()
-    ft.run(main=main, view=ft.AppView.WEB_BROWSER, host="127.0.0.1", port=8080)
+    ft.run(main=main, view=ft.AppView.WEB_BROWSER, host="0.0.0.0", port=8080)
