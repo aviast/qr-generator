@@ -2,6 +2,15 @@
 
 Flet web app for creating headshot QR sessions.
 
+## Development
+
+Use the Conda environment:
+
+```powershell
+conda activate qr_generator
+python app.py
+```
+
 ## Run With Docker Compose
 
 1. Optional: copy `.env.example` to `.env` and fill in SMTP settings if you want email delivery.

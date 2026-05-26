@@ -1,3 +1,6 @@
+# Dev note: run this project with the Conda environment named "qr_generator".
+# Example: conda activate qr_generator
+
 import flet as ft
 import qrcode
 from qrcode.constants import ERROR_CORRECT_H
@@ -13,6 +16,7 @@ import time
 import random
 import smtplib
 import sqlite3
+import urllib.parse
 import uuid
 from email.message import EmailMessage
 from datetime import datetime, timedelta
@@ -24,6 +28,7 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", SMTP_USER)
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL")
 
 QR_VERSION = 5
 QR_BOX_SIZE = 23
@@ -111,8 +116,32 @@ def safe_filename_part(value: str):
     value = SAFE_FILENAME_CHARS.sub("_", value.strip())
     return value.strip("._") or "session"
 
+def qr_image_src(data: str, box_size: int = QR_BOX_SIZE):
+    qr = qrcode.QRCode(
+        version=QR_VERSION,
+        error_correction=ERROR_CORRECT_H,
+        box_size=box_size,
+        border=4
+    )
+    qr.add_data(data)
+    qr.make(fit=True)
+    img = qr.make_image(image_factory=PilImage, fill_color="black", back_color="white")
+    buffer = io.BytesIO()
+    img.save(buffer, kind="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
 def get_client_ip(page: ft.Page):
     return (getattr(page, "client_ip", None) or UNKNOWN_IP_KEY).strip() or UNKNOWN_IP_KEY
+
+def build_session_url(page: ft.Page, session_name: str):
+    base_url = PUBLIC_BASE_URL or getattr(page, "url", None) or "http://localhost:8080/"
+    parsed = urllib.parse.urlparse(base_url)
+    if not parsed.scheme or not parsed.netloc:
+        parsed = urllib.parse.urlparse("http://localhost:8080/")
+
+    path = parsed.path or "/"
+    query = urllib.parse.urlencode({"session": session_name})
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, path, "", query, ""))
 
 def generate_session_csv(session_id: int):
     logger.debug("Generating CSV for session_id=%s", session_id)
@@ -335,6 +364,45 @@ def validate_session_code(session_name: str, code: str):
     logger.info("Session validation succeeded for active session_id=%s", session_id)
     return True, "Session active", session_id, db_code, bool(ask_email), bool(ask_phone), "active", email
 
+def get_public_session(session_name: str):
+    session_name = session_name.strip()
+    logger.info("Loading public session from URL name=%r", session_name)
+    if not session_name:
+        return False, "Session name missing", None
+
+    with db_lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT id, name, code, expiry, ask_email, ask_phone, status, email FROM sessions WHERE name=? AND status != 'deleted'",
+                (session_name,),
+            )
+            row = c.fetchone()
+
+            if not row:
+                logger.warning("Public session load failed: name=%r not found or deleted", session_name)
+                return False, "Session not found", None
+
+            session_id, name, code, expiry_str, ask_email, ask_phone, status, email = row
+            is_closed = datetime.now() > datetime.fromisoformat(expiry_str) or status == 'ended'
+            if is_closed:
+                logger.warning("Public session load failed: session_id=%s is closed or expired", session_id)
+                return False, "Session closed", None
+
+            c.execute("UPDATE sessions SET active=1 WHERE id=?", (session_id,))
+            conn.commit()
+
+    logger.info("Public session loaded session_id=%s name=%r", session_id, name)
+    return True, "Session active", {
+        "id": session_id,
+        "name": name,
+        "code": code,
+        "ask_email": bool(ask_email),
+        "ask_phone": bool(ask_phone),
+        "status": "active",
+        "email": email,
+    }
+
 def save_session_settings(session_id: int, ask_email: bool | None, ask_phone: bool | None):
     logger.info("Saving session settings session_id=%s ask_email=%s ask_phone=%s", session_id, ask_email, ask_phone)
     with db_lock:
@@ -493,6 +561,38 @@ async def main(page: ft.Page):
         "email": None
     }
 
+    def requested_session_name():
+        try:
+            return page.query.get("session").strip()
+        except Exception:
+            pass
+
+        url_parts = [
+            getattr(page, "url", None),
+            getattr(page, "route", None),
+            (getattr(page, "url", "") or "") + (getattr(page, "route", "") or ""),
+        ]
+        for url in url_parts:
+            if not url:
+                continue
+            query = urllib.parse.urlparse(url).query
+            session_name = urllib.parse.parse_qs(query).get("session", [""])[0].strip()
+            if session_name:
+                return session_name
+        return ""
+
+    def open_public_session(session_name: str):
+        ok, msg, session_data = get_public_session(session_name)
+        logger.info("Public session route result ok=%s msg=%r session_name=%r", ok, msg, session_name)
+        if not ok:
+            access_name_input.value = session_name
+            access_msg.value = msg
+            return False
+
+        current_session.update(session_data)
+        show_main_view()
+        return True
+
     # ==========================================
     # VIEW 1: SESSION LOGIN / CREATION
     # ==========================================
@@ -649,9 +749,10 @@ async def main(page: ft.Page):
             title=ft.Text(f"Administration: {current_session['name']}"),
         )
 
-        # Container setup for our two columns
-        left_panel = ft.Container(expand=1, padding=20, border=ft.Border(right=ft.BorderSide(1, ft.Colors.GREY_300)))
-        right_panel = ft.Container(expand=2, padding=20)
+        # Container setup for admin columns: session list is narrow, controls/link have more room.
+        sessions_panel = ft.Container(expand=1, padding=20, border=ft.Border(right=ft.BorderSide(1, ft.Colors.GREY_300)))
+        controls_panel = ft.Container(expand=2, padding=20, border=ft.Border(right=ft.BorderSide(1, ft.Colors.GREY_300)))
+        public_link_panel = ft.Container(expand=2, padding=20)
 
         def on_row_select(e, session_data):
             logger.info("Admin selected session_id=%s name=%r", session_data[0], session_data[1])
@@ -669,6 +770,8 @@ async def main(page: ft.Page):
         def build_panels():
             sessions = get_user_sessions(current_session["email"])
             logger.debug("Building admin panels with %s sessions", len(sessions))
+            session_url = build_session_url(page, current_session["name"])
+            session_url_qr_src = qr_image_src(session_url, box_size=8)
 
             # --- BUILD LEFT PANEL (Session List) ---
             list_tiles = []
@@ -689,7 +792,7 @@ async def main(page: ft.Page):
                 )
                 list_tiles.append(tile)
 
-            left_panel.content = ft.Column(
+            sessions_panel.content = ft.Column(
                 controls=[
                     ft.Text("Your Sessions", size=24, weight=ft.FontWeight.BOLD),
                     ft.ListView(controls=list_tiles, expand=True)
@@ -728,16 +831,22 @@ async def main(page: ft.Page):
                 logger.info("End session button clicked session_id=%s", current_session["id"])
                 ok, msg = end_session(current_session["id"])
                 logger.info("End session result ok=%s msg=%r", ok, msg)
-                # If deleted, try to select the next available session
-                remaining_sessions = get_user_sessions(current_session["email"])
-                if remaining_sessions:
-                    on_row_select(None, remaining_sessions[0])
-                else:
-                    # No sessions left; return to login screen
-                    current_session["id"] = None
-                    page.controls.clear()
-                    page.add(session_view)
-                    page.update()
+                current_session.update({
+                    "id": None,
+                    "name": None,
+                    "code": None,
+                    "ask_email": False,
+                    "ask_phone": False,
+                    "status": None,
+                    "email": None,
+                })
+                access_name_input.value = ""
+                access_code_input.value = ""
+                access_msg.value = msg
+                page.appbar = None
+                page.controls.clear()
+                page.add(session_view)
+                page.update()
 
             def on_to_app(e):
                 logger.info("Switching to main app session_id=%s", current_session["id"])
@@ -749,8 +858,22 @@ async def main(page: ft.Page):
             to_app_button = ft.Button("To the App...", on_click=on_to_app, disabled=is_closed)
             end_session_btn = ft.Button("End Session", on_click=on_end_session, disabled=is_closed)
             download_button = ft.OutlinedButton("Download Session Names (.csv)", icon=ft.Icons.DOWNLOAD, on_click=on_download_click)
+            session_url_field = ft.TextField(
+                label="Session URL",
+                value=session_url,
+                read_only=True,
+                multiline=True,
+                min_lines=2,
+                max_lines=3,
+            )
+            session_url_qr = ft.Image(
+                src=session_url_qr_src,
+                width=320,
+                height=320,
+                fit=ft.BoxFit.CONTAIN,
+            )
 
-            right_panel.content = ft.Column(
+            controls_panel.content = ft.Column(
                 controls=[
                     ft.Text(f"Administration: {current_session['name']}", size=32, weight=ft.FontWeight.BOLD),
                     ft.Divider(height=40),
@@ -762,21 +885,33 @@ async def main(page: ft.Page):
                     ft.OutlinedButton("Upload Name List (.txt)", on_click=upload_name_list),
                     download_button,
                     upload_msg_local,
+                    ft.Divider(height=24),
                     end_session_btn,
-                    #ft.OutlinedButton("End & Delete Session", on_click=on_end_session, icon=ft.Icons.WARNING, icon_color="red"),
-                    ft.Divider(height=40),
                     to_app_button
-                    #ft.FilledButton("To the App...", on_click=on_to_app, icon=ft.Icons.ARROW_FORWARD, width=200, height=50)
                 ],
                 alignment=ft.MainAxisAlignment.START,
-                horizontal_alignment=ft.CrossAxisAlignment.START
+                horizontal_alignment=ft.CrossAxisAlignment.START,
+                spacing=12,
+                expand=True,
+            )
+
+            public_link_panel.content = ft.Column(
+                controls=[
+                    ft.Text("Public Session Link", size=20),
+                    session_url_field,
+                    session_url_qr,
+                ],
+                alignment=ft.MainAxisAlignment.START,
+                horizontal_alignment=ft.CrossAxisAlignment.START,
+                spacing=12,
+                expand=True,
             )
 
         # Trigger the initial build of the layout
         build_panels()
 
         admin_view = ft.Row(
-            controls=[left_panel, right_panel],
+            controls=[sessions_panel, controls_panel, public_link_panel],
             expand=True,
             vertical_alignment=ft.CrossAxisAlignment.START
         )
@@ -912,20 +1047,7 @@ async def main(page: ft.Page):
                 return
             name_msg_local.value = ""
 
-            qr = qrcode.QRCode(
-                version=QR_VERSION,
-                error_correction=ERROR_CORRECT_H,
-                box_size=QR_BOX_SIZE,
-                border=4
-            )
-            qr.add_data(name)
-            qr.make(fit=True)
-            img = qr.make_image(image_factory=PilImage, fill_color="black", back_color="white")
-            buffer = io.BytesIO()
-            img.save(buffer, kind="PNG")
-            qr_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-            qr_image_local.src = qr_base64
+            qr_image_local.src = qr_image_src(name)
             name_display_local.value = name
             input_view_local.visible = False
             display_view_local.visible = True
@@ -988,6 +1110,12 @@ async def main(page: ft.Page):
         page.update()
 
     # App Start
+    initial_session_name = requested_session_name()
+    if initial_session_name:
+        logger.info("Initial URL requested public session name=%r", initial_session_name)
+        if open_public_session(initial_session_name):
+            return
+
     logger.info("Showing initial session view")
     page.add(session_view)
 
