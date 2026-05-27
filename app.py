@@ -137,6 +137,10 @@ def get_client_ip(page: ft.Page):
 def build_session_url(page: ft.Page, session_name: str):
     base_url = PUBLIC_BASE_URL or getattr(page, "url", None) or "http://localhost:8080/"
     parsed = urllib.parse.urlparse(base_url)
+    if parsed.scheme == "ws":
+        parsed = parsed._replace(scheme="http")
+    elif parsed.scheme == "wss":
+        parsed = parsed._replace(scheme="https")
     if not parsed.scheme or not parsed.netloc:
         parsed = urllib.parse.urlparse("http://localhost:8080/")
 
