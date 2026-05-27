@@ -48,8 +48,8 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ id: meta.outputs.tags }}
-          labels: ${{ id: meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           # Ensures efficient building across cache layers
           cache-from: type=gha
           cache-to: type=gha,mode=max
