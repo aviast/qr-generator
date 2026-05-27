@@ -21,6 +21,7 @@ import uuid
 from email.message import EmailMessage
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 # --- Configuration & Environment ---
 SMTP_HOST = os.environ.get("SMTP_HOST")
@@ -774,7 +775,7 @@ async def main(page: ft.Page):
             session_url_qr_src = qr_image_src(session_url, box_size=8)
 
             # --- BUILD LEFT PANEL (Session List) ---
-            list_tiles = []
+            list_tiles: list[ft.Control] = []
             for s in sessions:
                 sid, sname, sstart, sexpiry, sactive, scode, sask_email, sask_phone = s
                 is_expired = datetime.now() > datetime.fromisoformat(sexpiry)
@@ -793,10 +794,10 @@ async def main(page: ft.Page):
                 list_tiles.append(tile)
 
             sessions_panel.content = ft.Column(
-                controls=[
+                controls=cast(list[ft.Control], [
                     ft.Text("Your Sessions", size=24, weight=ft.FontWeight.BOLD),
                     ft.ListView(controls=list_tiles, expand=True)
-                ],
+                ]),
                 expand=True
             )
 
