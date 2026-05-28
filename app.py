@@ -323,12 +323,13 @@ def validate_session_code(session_name: str, code: str) -> tuple[bool, str, Opti
         logger.warning("Session validation failed: invalid code for session_id=%s", session.id)
         return False, "Invalid code", None
 
+    activated_count = session_repo.mark_active_sessions_by_email(session.email, datetime.now().isoformat())
+    logger.info("Activated %s available sessions for email=%s", activated_count, session.email)
+
     if session.is_expired:
         logger.info("Session validation succeeded for ended/grace session_id=%s", session.id)
         return True, "Session closed (Grace Period)", session
 
-    # Otherwise mark it active in storage
-    session_repo.mark_as_active(session.id)
     session.active = 1  # sync local object state
 
     logger.info("Session validation succeeded for active session_id=%s", session.id)
@@ -657,6 +658,11 @@ async def main(page: ft.Page):
         async def on_download_click(e):
             session_id = current_session["id"]
             logger.info("Download session names clicked session_id=%s", session_id)
+            session = session_repo.get_by_id(session_id)
+            if not session or session.status == "deleted":
+                logger.warning("Download ignored for deleted or missing session_id=%s", session_id)
+                return
+
             filename, csv_bytes = generate_session_csv(session_id)
 
             if not csv_bytes:
@@ -687,6 +693,7 @@ async def main(page: ft.Page):
         sessions_panel = ft.Container(expand=1, padding=20, border=ft.Border(right=ft.BorderSide(1, ft.Colors.GREY_300)))
         controls_panel = ft.Container(expand=2, padding=20, border=ft.Border(right=ft.BorderSide(1, ft.Colors.GREY_300)))
         public_link_panel = ft.Container(expand=2, padding=20)
+        show_deleted_sessions = False
 
         def on_row_select(e, session_data: Session):
             logger.info("Admin selected session_id=%s name=%r", session_data.id, session_data.name)
@@ -699,42 +706,88 @@ async def main(page: ft.Page):
             build_panels()
             page.update()
 
+        def timestamp_label(value: str, future_label: str, past_label: str, now: datetime):
+            try:
+                label = past_label if datetime.fromisoformat(value) <= now else future_label
+            except ValueError:
+                label = past_label
+            return f"{label}: {value[:16]}"
+
         def build_panels():
+            nonlocal show_deleted_sessions
             sessions = get_user_sessions(current_session["email"])
             logger.debug("Building admin panels with %s sessions", len(sessions))
+            visible_sessions = sessions if show_deleted_sessions else [s for s in sessions if s.status != "deleted"]
+            selected_session = next((s for s in sessions if s.id == current_session["id"]), None)
+            if selected_session and selected_session.status == "deleted" and not show_deleted_sessions:
+                selected_session = visible_sessions[0] if visible_sessions else None
+                if selected_session:
+                    current_session.update({
+                        "id": selected_session.id,
+                        "name": selected_session.name,
+                        "code": selected_session.code,
+                        "ask_email": bool(selected_session.ask_email),
+                        "ask_phone": bool(selected_session.ask_phone),
+                        "status": selected_session.status,
+                    })
+
             session_url = build_session_url(page, current_session["name"])
             session_url_qr_src = qr_image_src(session_url, box_size=8)
-            is_closed = current_session.get("status") == "ended"
+            is_closed = (
+                selected_session is None
+                or selected_session.status == "deleted"
+                or selected_session.is_expired
+            )
+            is_deleted = selected_session is None or selected_session.status == "deleted"
+            now = datetime.now()
+
+            def on_show_deleted_change(e):
+                nonlocal show_deleted_sessions
+                show_deleted_sessions = bool(e.control.value)
+                build_panels()
+                page.update()
 
             list_tiles: list[ft.Control] = []
-            for s in sessions:
-                # Visually distinguish active vs. expired sessions
-                icon = ft.Icons.CHECK_CIRCLE if not s.is_expired else ft.Icons.CANCEL
-                icon_color = ft.Colors.GREEN if not s.is_expired else ft.Colors.GREY
+            for s in visible_sessions:
+                is_unavailable = s.status == "deleted" or s.is_expired
+                icon = ft.Icons.CHECK_CIRCLE if not is_unavailable else ft.Icons.CANCEL
+                icon_color = ft.Colors.GREEN if not is_unavailable else ft.Colors.GREY
+                status_label = "Deleted" if s.status == "deleted" else "Closed" if s.is_expired else "Active"
+                start_label = timestamp_label(s.start, "Starts", "Started", now)
+                expiry_label = timestamp_label(s.expiry, "Expires", "Expired", now)
 
                 tile = ft.ListTile(
                     leading=ft.Icon(icon, color=icon_color),
                     title=ft.Text(s.name, weight=ft.FontWeight.BOLD),
-                    subtitle=ft.Text(f"Starts: {s.start[:16]}\nExpires: {s.expiry[:16]}"),
+                    subtitle=ft.Text(f"{status_label}\n{start_label}\n{expiry_label}"),
                     selected=(s.id == current_session["id"]),
                     on_click=lambda e, data=s: on_row_select(e, data)
                 )
                 list_tiles.append(tile)
 
+            show_deleted_checkbox = ft.Checkbox(
+                label="Show Deleted Sessions",
+                value=show_deleted_sessions,
+                on_change=on_show_deleted_change,
+            )
+
             sessions_panel.content = ft.Column(
                 controls=cast(list[ft.Control], [
                     ft.Text("Your Sessions", size=24, weight=ft.FontWeight.BOLD),
+                    show_deleted_checkbox,
                     ft.ListView(controls=list_tiles, expand=True)
                 ]),
                 expand=True
             )
 
             # --- BUILD RIGHT PANEL (Admin Controls) ---
-            email_checkbox = ft.Checkbox(label="Show prompt for Email Address", value=current_session["ask_email"])
-            phone_checkbox = ft.Checkbox(label="Show prompt for Mobile Phone", value=current_session["ask_phone"])
+            email_checkbox = ft.Checkbox(label="Show prompt for Email Address", value=current_session["ask_email"], disabled=is_closed)
+            phone_checkbox = ft.Checkbox(label="Show prompt for Mobile Phone", value=current_session["ask_phone"], disabled=is_closed)
             upload_msg_local = ft.Text()
 
             async def upload_name_list(e):
+                if is_closed:
+                    return
                 logger.info("Name list upload started session_id=%s", current_session["id"])
                 files = await ft.FilePicker().pick_files(
                     allow_multiple=False,
@@ -778,6 +831,8 @@ async def main(page: ft.Page):
                 page.update()
 
             def on_to_app(e):
+                if is_closed:
+                    return
                 logger.info("Switching to main app session_id=%s", current_session["id"])
                 current_session["ask_email"] = email_checkbox.value
                 current_session["ask_phone"] = phone_checkbox.value
@@ -786,7 +841,7 @@ async def main(page: ft.Page):
 
             to_app_button = ft.Button("To the App...", on_click=on_to_app, disabled=is_closed)
             end_session_btn = ft.Button("End Session", on_click=on_end_session, disabled=is_closed)
-            download_button = ft.OutlinedButton("Download Session Names (.csv)", icon=ft.Icons.DOWNLOAD, on_click=on_download_click)
+            download_button = ft.OutlinedButton("Download Session Names (.csv)", icon=ft.Icons.DOWNLOAD, on_click=on_download_click, disabled=is_deleted)
             session_url_field = ft.TextField(
                 label="Session URL",
                 value=session_url,
@@ -811,7 +866,7 @@ async def main(page: ft.Page):
                     phone_checkbox,
                     ft.Divider(height=40),
                     ft.Text("Data Management", size=20),
-                    ft.OutlinedButton("Upload Name List (.txt)", on_click=upload_name_list),
+                    ft.OutlinedButton("Upload Name List (.txt)", on_click=upload_name_list, disabled=is_closed),
                     download_button,
                     upload_msg_local,
                     ft.Divider(height=24),

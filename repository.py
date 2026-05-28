@@ -30,7 +30,7 @@ class SessionRepository:
         with self.lock, sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
-            c.execute("SELECT * FROM sessions WHERE email=? AND status != 'deleted' ORDER BY start DESC", (email,))
+            c.execute("SELECT * FROM sessions WHERE email=? ORDER BY start DESC", (email,))
             return [self._row_to_model(row) for row in c.fetchall()]
 
     def create(self, session: Session) -> Optional[int]:
@@ -63,6 +63,16 @@ class SessionRepository:
             c = conn.cursor()
             c.execute("UPDATE sessions SET active=1 WHERE id=?", (session_id,))
             conn.commit()
+
+    def mark_active_sessions_by_email(self, email: str, now: str) -> int:
+        with self.lock, sqlite3.connect(self.db_path) as conn:
+            c = conn.cursor()
+            c.execute(
+                "UPDATE sessions SET active=1 WHERE email=? AND status='active' AND expiry>=?",
+                (email, now),
+            )
+            conn.commit()
+            return c.rowcount
 
     def get_expired_active_ids(self, now: str) -> List[int]:
         with self.lock, sqlite3.connect(self.db_path) as conn:
