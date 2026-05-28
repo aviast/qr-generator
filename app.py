@@ -21,7 +21,10 @@ import uuid
 from email.message import EmailMessage
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import cast, Optional
+
+from models import Entry, Session
+from repository import DailyLimitRepository, EntryRepository, PreloadedNameRepository, SessionRepository
 
 # --- Configuration & Environment ---
 SMTP_HOST = os.environ.get("SMTP_HOST")
@@ -58,6 +61,11 @@ DB_PATH = os.path.join(STORAGE_DIR, "headshots.db")
 
 # A global lock to prevent SQLite database locking errors under concurrent load
 db_lock = threading.Lock()
+
+session_repo = SessionRepository(DB_PATH, db_lock)
+limit_repo = DailyLimitRepository(DB_PATH, db_lock)
+entry_repo = EntryRepository(DB_PATH, db_lock)
+name_repo = PreloadedNameRepository(DB_PATH, db_lock)
 
 def init_db():
     logger.info("Initializing database at %s", DB_PATH)
@@ -113,10 +121,6 @@ def today_key():
 def normalize_email(email: str):
     return email.strip().lower()
 
-def safe_filename_part(value: str):
-    value = SAFE_FILENAME_CHARS.sub("_", value.strip())
-    return value.strip("._") or "session"
-
 def qr_image_src(data: str, box_size: int = QR_BOX_SIZE):
     qr = qrcode.QRCode(
         version=QR_VERSION,
@@ -150,66 +154,38 @@ def build_session_url(page: ft.Page, session_name: str):
 
 def generate_session_csv(session_id: int):
     logger.debug("Generating CSV for session_id=%s", session_id)
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("SELECT name, start FROM sessions WHERE id=?", (session_id,))
-            row = c.fetchone()
-            if not row:
-                logger.warning("Cannot generate CSV: session_id=%s not found", session_id)
-                return None, None
-            session_name, start_str = row
 
-            # Create a clean safe filename
-            safe_name = SAFE_FILENAME_CHARS.sub("_", session_name)
-            csv_filename = datetime.fromisoformat(start_str).strftime("%Y%m%d_%H%M%S_") + safe_name + "_Headshot_Log.csv"
+    session = session_repo.get_by_id(session_id)
+    if not session:
+        logger.warning("Cannot generate CSV: session_id=%s not found", session_id)
+        return None, None
 
-            # Pull entries sorted chronologically
-            c.execute("SELECT timestamp, subject_name, email, phone, ip_address, device_id FROM entries WHERE session_id=? ORDER BY timestamp ASC", (session_id,))
-            rows = c.fetchall()
-            logger.info("Generated CSV for session_id=%s with %s entries", session_id, len(rows))
+    safe_name = SAFE_FILENAME_CHARS.sub("_", session.name)
+    csv_filename = datetime.fromisoformat(session.start).strftime("%Y%m%d_%H%M%S_") + safe_name + "_Headshot_Log.csv"
 
-            output = io.StringIO()
-            writer = csv.writer(output)
-            writer.writerow(["Timestamp", "Subject_Name", "Email", "Phone", "IP_Address", "Device_ID"])
-            writer.writerows(rows)
-            return csv_filename, output.getvalue().encode("utf-8")
+    entries = entry_repo.get_by_session_id(session_id)
+    logger.info("Generated CSV for session_id=%s with %s entries", session_id, len(entries))
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Timestamp", "Subject_Name", "Email", "Phone", "IP_Address", "Device_ID"])
+
+    # Iterate over our clean Entry objects
+    for e in entries:
+        writer.writerow([e.timestamp, e.subject_name, e.email, e.phone, e.ip_address, e.device_id])
+
+    return csv_filename, output.getvalue().encode("utf-8")
 
 # --- Database Limit Functions ---
-def check_creation_limit(limit_type: str, key: str, today: str):
+def check_creation_limit(limit_type: str, key: str, today: str) -> bool:
     logger.debug("Checking creation limit type=%s key=%s date=%s", limit_type, key, today)
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("SELECT count FROM daily_limits WHERE limit_type=? AND key_value=? AND date=?", (limit_type, key, today))
-            row = c.fetchone()
-            if row and row[0] >= MAX_SESSIONS_PER_DAY:
-                logger.warning("Creation limit reached type=%s key=%s date=%s count=%s", limit_type, key, today, row[0])
-                return False
-            return True
 
-def increment_creation_limit(limit_type: str, key: str):
-    today = today_key()
-    logger.debug("Incrementing creation limit type=%s key=%s date=%s", limit_type, key, today)
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute('''INSERT INTO daily_limits (limit_type, key_value, date, count)
-                         VALUES (?, ?, ?, 1)
-                         ON CONFLICT(limit_type, key_value, date)
-                         DO UPDATE SET count=count+1''', (limit_type, key, today))
-            conn.commit()
+    current_count = limit_repo.get_count(limit_type, key, today)
+    if current_count >= MAX_SESSIONS_PER_DAY:
+        logger.warning("Creation limit reached type=%s key=%s date=%s count=%s", limit_type, key, today, current_count)
+        return False
 
-def cleanup_daily_limits():
-    today = today_key()
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("DELETE FROM daily_limits WHERE date != ?", (today,))
-            deleted = c.rowcount
-            conn.commit()
-    if deleted:
-        logger.info("Cleaned up %s stale daily limit rows", deleted)
+    return True
 
 # --- Name Preloading Functions ---
 def parse_name_file(file_name: str, data: bytes):
@@ -242,27 +218,20 @@ def parse_name_file(file_name: str, data: bytes):
     logger.info("Parsed %s names from %s", len(names), file_name)
     return True, f"Loaded {len(names)} names", names
 
-def set_preloaded_names(session_id: int, names: list[str]):
+def set_preloaded_names(session_id: int, names: list[str]) -> tuple[bool, str]:
     logger.info("Replacing preloaded names for session_id=%s with %s names", session_id, len(names))
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("DELETE FROM preloaded_names WHERE session_id=?", (session_id,))
-            c.executemany("INSERT INTO preloaded_names (session_id, name) VALUES (?, ?)", [(session_id, n) for n in names])
-            conn.commit()
+
+    name_repo.replace_for_session(session_id, names)
+
     return True, f"Loaded {len(names)} names"
 
-def find_name_matches(session_id: int, prefix: str):
+def find_name_matches(session_id: int, prefix: str) -> list[str]:
     prefix = prefix.strip()
     if not prefix:
         return []
+
     logger.debug("Finding name matches for session_id=%s prefix=%r", session_id, prefix)
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            # SQLite LIKE is case-insensitive for ASCII by default
-            c.execute("SELECT name FROM preloaded_names WHERE session_id=? AND name LIKE ? LIMIT ?", (session_id, prefix + '%', MAX_VISIBLE_SUGGESTIONS))
-            return [row[0] for row in c.fetchall()]
+    return name_repo.find_matches(session_id, prefix, MAX_VISIBLE_SUGGESTIONS)
 
 # --- Email Function ---
 def send_email(to_email: str, subject: str, body: str, attachment_bytes: bytes | None = None, attachment_filename: str | None = None):
@@ -303,71 +272,67 @@ def create_session(session_name: str, email: str, source_ip: str):
     source_ip = (source_ip or UNKNOWN_IP_KEY).strip() or UNKNOWN_IP_KEY
     today = today_key()
 
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            # Only block creation if an ACTIVE (non-deleted) session shares the name
-            c.execute("SELECT id FROM sessions WHERE name=? AND status != 'deleted'", (session_name,))
-            if c.fetchone():
-                logger.warning("Create session rejected: duplicate active name=%r", session_name)
-                return False, "An active session with this name already exists"
+    # Use the repo instead of SQL
+    if session_repo.get_by_name(session_name):
+        logger.warning("Create session rejected: duplicate active name=%r", session_name)
+        return False, "An active session with this name already exists"
 
     if not check_creation_limit("ip", source_ip, today):
-        logger.warning("Create session rejected by IP limit source_ip=%s", source_ip)
         return False, "Daily session limit reached for this IP address"
     if not check_creation_limit("email", email, today):
-        logger.warning("Create session rejected by email limit email=%s", email)
         return False, "Daily session limit reached for this email address"
 
     code = generate_code()
     start_dt = datetime.now()
     expiry_dt = start_dt + timedelta(hours=24)
 
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute('''INSERT INTO sessions (name, email, source_ip, code, start, expiry, active, status, ask_email, ask_phone)
-                         VALUES (?, ?, ?, ?, ?, ?, 0, 'active', 0, 0)''',
-                         (session_name, email, source_ip, code, start_dt.isoformat(), expiry_dt.isoformat()))
-            session_id = c.lastrowid
-            conn.commit()
+    # Use the dataclass to create the record
+    new_session = Session(
+        id=None,
+        name=session_name,
+        email=email,
+        source_ip=source_ip,
+        code=code,
+        start=start_dt.isoformat(),
+        expiry=expiry_dt.isoformat(),
+        active=0,
+        status='active',
+        ask_email=0,
+        ask_phone=0
+    )
+    session_id = session_repo.create(new_session)
     logger.info("Created session_id=%s name=%r expiry=%s", session_id, session_name, expiry_dt.isoformat())
 
-    increment_creation_limit("ip", source_ip)
-    increment_creation_limit("email", email)
+    limit_repo.increment("ip", source_ip, today)
+    limit_repo.increment("email", email, today)
 
     subject = f"Your access code for session '{session_name}'"
     body = f"Your 4-digit access code is: {code}\nThis session will expire at {expiry_dt.isoformat()}"
     send_email(email, subject, body)
     return True, "Code sent"
 
-def validate_session_code(session_name: str, code: str):
+def validate_session_code(session_name: str, code: str) -> tuple[bool, str, Optional[Session]]:
     logger.info("Validating access code for session name=%r", session_name)
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("SELECT id, code, expiry, ask_email, ask_phone, status, email FROM sessions WHERE name=? AND status != 'deleted'", (session_name,))
-            row = c.fetchone()
-            if not row:
-                logger.warning("Session validation failed: name=%r not found or deleted", session_name)
-                return False, "Session not found or fully purged.", None, None, False, False, None, None
 
-            session_id, db_code, expiry_str, ask_email, ask_phone, status, email = row
-            if db_code != code:
-                logger.warning("Session validation failed: invalid code for session_id=%s name=%r", session_id, session_name)
-                return False, "Invalid code", None, None, False, False, None, None
+    session = session_repo.get_by_name(session_name)
+    if not session:
+        logger.warning("Session validation failed: name=%r not found or deleted", session_name)
+        return False, "Session not found or fully purged.", None
 
-            is_expired = datetime.now() > datetime.fromisoformat(expiry_str) or status == 'ended'
+    if session.code != code:
+        logger.warning("Session validation failed: invalid code for session_id=%s", session.id)
+        return False, "Invalid code", None
 
-            if is_expired:
-                logger.info("Session validation succeeded for ended/grace session_id=%s", session_id)
-                return True, "Session closed (Grace Period)", session_id, db_code, bool(ask_email), bool(ask_phone), "ended", email
+    if session.is_expired:
+        logger.info("Session validation succeeded for ended/grace session_id=%s", session.id)
+        return True, "Session closed (Grace Period)", session
 
-            c.execute("UPDATE sessions SET active=1 WHERE id=?", (session_id,))
-            conn.commit()
+    # Otherwise mark it active in storage
+    session_repo.mark_as_active(session.id)
+    session.active = 1  # sync local object state
 
-    logger.info("Session validation succeeded for active session_id=%s", session_id)
-    return True, "Session active", session_id, db_code, bool(ask_email), bool(ask_phone), "active", email
+    logger.info("Session validation succeeded for active session_id=%s", session.id)
+    return True, "Session active", session
 
 def get_public_session(session_name: str):
     session_name = session_name.strip()
@@ -375,160 +340,116 @@ def get_public_session(session_name: str):
     if not session_name:
         return False, "Session name missing", None
 
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute(
-                "SELECT id, name, code, expiry, ask_email, ask_phone, status, email FROM sessions WHERE name=? AND status != 'deleted'",
-                (session_name,),
-            )
-            row = c.fetchone()
+    session = session_repo.get_by_name(session_name)
+    if not session:
+        return False, "Session not found", None
 
-            if not row:
-                logger.warning("Public session load failed: name=%r not found or deleted", session_name)
-                return False, "Session not found", None
+    if session.is_expired:
+        return False, "Session closed", None
 
-            session_id, name, code, expiry_str, ask_email, ask_phone, status, email = row
-            is_closed = datetime.now() > datetime.fromisoformat(expiry_str) or status == 'ended'
-            if is_closed:
-                logger.warning("Public session load failed: session_id=%s is closed or expired", session_id)
-                return False, "Session closed", None
+    session_repo.mark_as_active(session.id)
 
-            c.execute("UPDATE sessions SET active=1 WHERE id=?", (session_id,))
-            conn.commit()
-
-    logger.info("Public session loaded session_id=%s name=%r", session_id, name)
     return True, "Session active", {
-        "id": session_id,
-        "name": name,
-        "code": code,
-        "ask_email": bool(ask_email),
-        "ask_phone": bool(ask_phone),
+        "id": session.id,
+        "name": session.name,
+        "code": session.code,
+        "ask_email": bool(session.ask_email),
+        "ask_phone": bool(session.ask_phone),
         "status": "active",
-        "email": email,
+        "email": session.email,
     }
-
-def save_session_settings(session_id: int, ask_email: bool | None, ask_phone: bool | None):
-    logger.info("Saving session settings session_id=%s ask_email=%s ask_phone=%s", session_id, ask_email, ask_phone)
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("UPDATE sessions SET ask_email=?, ask_phone=? WHERE id=?", (int(ask_email) if ask_email is not None else None, int(ask_phone) if ask_phone is not None else None, session_id))
-            conn.commit()
 
 def end_session(session_id: int):
     logger.info("End session requested session_id=%s", session_id)
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("SELECT name, email, status FROM sessions WHERE id=?", (session_id,))
-            session_row = c.fetchone()
-            if not session_row:
-                logger.warning("End session failed: session_id=%s not found", session_id)
-                return False, "Session not found."
 
-            session_name, email, status = session_row
-            if status == 'ended' or status == 'deleted':
-                logger.info("End session skipped: session_id=%s already status=%s", session_id, status)
-                return True, "Session already closed."
+    session = session_repo.get_by_id(session_id)
+    if not session:
+        return False, "Session not found."
 
-    # Generate the log data and dispatch backup email
+    if session.status in ('ended', 'deleted'):
+        return True, "Session already closed."
+
     csv_filename, attachment_bytes = generate_session_csv(session_id)
-    if csv_filename and email:
-        subject = f"Session '{session_name}' results"
-        body = f"Attached is the CSV for session '{session_name}' which closed at {datetime.now().isoformat()}."
+    if csv_filename and session.email:
+        subject = f"Session '{session.name}' results"
+        body = f"Attached is the CSV for session '{session.name}' which closed at {datetime.now().isoformat()}."
         try:
-            send_email(email, subject, body, attachment_bytes=attachment_bytes, attachment_filename=csv_filename)
-        except Exception as e:
-            logger.exception("Backup email failed for session_id=%s. Session will still transition to allow manual download.", session_id)
+            send_email(session.email, subject, body, attachment_bytes=attachment_bytes, attachment_filename=csv_filename)
+        except Exception:
+            logger.exception("Backup email failed for session_id=%s.", session_id)
 
     now_str = datetime.now().isoformat()
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            # Set status to ended and reset expiry to current time to mark the start of the 24h window
-            c.execute("UPDATE sessions SET status='ended', active=0, expiry=? WHERE id=?", (now_str, session_id))
-            conn.commit()
+    session_repo.end_session_status(session_id, now_str)
 
     logger.info("Session closed session_id=%s retained_until_start=%s", session_id, now_str)
     return True, "Session closed. Retained for 24 hours."
 
 def get_user_sessions(email: str):
     logger.debug("Fetching sessions for email=%s", email)
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            # Fetch all non-deleted sessions for this email, ordered newest first
-            c.execute('''SELECT id, name, start, expiry, active, code, ask_email, ask_phone
-                         FROM sessions WHERE email=? AND status != 'deleted' ORDER BY start DESC''', (email,))
-            rows = c.fetchall()
-            logger.info("Fetched %s sessions for email=%s", len(rows), email)
-            return rows
+    return session_repo.get_all_by_email(email)
 
-def append_entry(session_id: int, person_name: str, email: str ="", phone: str ="", ip_address: str ="", device_id: str=""):
+def append_entry(session_id: int, person_name: str, email: str ="", phone: str ="", ip_address: str ="", device_id: str="") -> tuple[bool, str]:
     logger.info("Append entry requested session_id=%s person_name=%r", session_id, person_name)
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            # Verify session exists
-            c.execute("SELECT active FROM sessions WHERE id=?", (session_id,))
-            if not c.fetchone():
-                logger.warning("Append entry failed: session_id=%s not found", session_id)
-                return False, "Session not found"
 
-            # Check capacity
-            c.execute("SELECT COUNT(*) FROM entries WHERE session_id=?", (session_id,))
-            entry_count = c.fetchone()[0]
-            if entry_count >= MAX_NAMES_PER_SESSION:
-                logger.warning("Append entry failed: session_id=%s limit reached count=%s", session_id, entry_count)
-                return False, f"Session limit reached ({MAX_NAMES_PER_SESSION} names)"
+    # 1. Verify session is still valid
+    session = session_repo.get_by_id(session_id)
+    if not session or not session.active:
+        logger.warning("Append entry failed: session_id=%s not found or inactive", session_id)
+        return False, "Session not found or inactive"
 
-            # Insert entry
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            c.execute('''INSERT INTO entries (session_id, timestamp, subject_name, email, phone, ip_address, device_id)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                         (session_id, timestamp, person_name, email, phone, ip_address, device_id))
-            conn.commit()
+    # 2. Check capacity
+    entry_count = entry_repo.count_by_session_id(session_id)
+    if entry_count >= MAX_NAMES_PER_SESSION:
+        logger.warning("Append entry failed: session_id=%s limit reached count=%s", session_id, entry_count)
+        return False, f"Session limit reached ({MAX_NAMES_PER_SESSION} names)"
 
+    # 3. Create the Entry object and save it
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    new_entry = Entry(
+        id=None,
+        session_id=session_id,
+        timestamp=timestamp,
+        subject_name=person_name,
+        email=email,
+        phone=phone,
+        ip_address=ip_address,
+        device_id=device_id
+    )
+
+    entry_repo.create(new_entry)
     logger.info("Entry appended session_id=%s timestamp=%s", session_id, timestamp)
+
     return True, "Name added"
 
 def expiry_worker():
     logger.info("Expiry worker started")
     while True:
         now_str = datetime.now().isoformat()
-        cleanup_daily_limits()
 
-        # Phase 1: Close active sessions whose scheduled time is up
-        to_close = []
-        with db_lock:
-            with sqlite3.connect(DB_PATH) as conn:
-                c = conn.cursor()
-                c.execute("SELECT id FROM sessions WHERE expiry < ? AND status = 'active'", (now_str,))
-                to_close = [row[0] for row in c.fetchall()]
+        # 1. Clean up rate limits
+        limit_repo.delete_old_limits(today_key())
 
-        for sid in to_close:
+        # 2. Phase 1: Close active sessions whose scheduled time is up
+        to_close_ids = session_repo.get_expired_active_ids(now_str)
+
+        for sid in to_close_ids:
             logger.info("Automatically closing expired active session_id=%s", sid)
             try:
                 end_session(sid)
-            except Exception as ex:
+            except Exception:
                 logger.exception("Error auto-closing session_id=%s", sid)
 
-        # Phase 2: Permanently purge data for sessions closed > 24 hours ago
+        # 3. Phase 2: Permanently purge data for sessions closed > 24 hours ago
         purge_cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
-        to_purge = []
-        with db_lock:
-            with sqlite3.connect(DB_PATH) as conn:
-                c = conn.cursor()
-                c.execute("SELECT id FROM sessions WHERE status = 'ended' AND expiry < ?", (purge_cutoff,))
-                to_purge = [row[0] for row in c.fetchall()]
+        to_purge_ids = session_repo.get_ended_ids_before(purge_cutoff)
 
-                for sid in to_purge:
-                    logger.info("Privacy purge: permanently deleting data for session_id=%s", sid)
-                    c.execute("UPDATE sessions SET status='deleted' WHERE id=?", (sid,))
-                    c.execute("DELETE FROM entries WHERE session_id=?", (sid,))
-                    c.execute("DELETE FROM preloaded_names WHERE session_id=?", (sid,))
-                conn.commit()
+        for sid in to_purge_ids:
+            logger.info("Privacy purge: permanently deleting data for session_id=%s", sid)
+
+            # Use our new repository methods to safely clear the data
+            session_repo.mark_as_deleted(sid)
+            entry_repo.delete_by_session_id(sid)
+            name_repo.delete_by_session_id(sid)
 
         time.sleep(60)
 
@@ -608,6 +529,18 @@ async def main(page: ft.Page):
     access_name_input = ft.TextField(label="Existing session name", width=420)
     access_code_input = ft.TextField(label="4-digit code", width=420)
     access_msg = ft.Text()
+    last_synced_session_name = ""
+
+    def on_session_name_change(e):
+        nonlocal last_synced_session_name
+        new_name = session_name_input.value.strip()
+        current_access_name = access_name_input.value.strip()
+        if not current_access_name or current_access_name == last_synced_session_name:
+            access_name_input.value = new_name
+            last_synced_session_name = new_name
+            page.update()
+
+    session_name_input.on_change = on_session_name_change
 
     def on_create(e):
         name = session_name_input.value.strip()
@@ -626,20 +559,19 @@ async def main(page: ft.Page):
     def on_access(e):
         name = access_name_input.value.strip()
         code = access_code_input.value.strip()
-        logger.info("Access session button clicked name=%r code_length=%s", name, len(code))
 
-        ok, msg, session_id, db_code, ask_email, ask_phone, status, email = validate_session_code(name, code)
-        logger.info("Access session result ok=%s msg=%r session_id=%s status=%s", ok, msg, session_id, status)
+        ok, msg, session = validate_session_code(name, code)
 
-        if ok:
+        if ok and session:
+            # Map the clean object back into the dictionary Flet is watching
             current_session.update({
-                "id": session_id,
-                "name": name,
-                "code": db_code,
-                "ask_email": ask_email,
-                "ask_phone": ask_phone,
-                "status": status,
-                "email": email
+                "id": session.id,
+                "name": session.name,
+                "code": session.code,
+                "ask_email": bool(session.ask_email),
+                "ask_phone": bool(session.ask_phone),
+                "status": session.status,
+                "email": session.email
             })
             show_admin_view()
         else:
@@ -747,9 +679,6 @@ async def main(page: ft.Page):
                 logger.exception("Download failed for session_id=%s filename=%s", session_id, filename)
                 page.show_dialog(ft.SnackBar(ft.Text("Download failed. Check the logs for details.")))
 
-        # Contextual awareness: check if this session is already closed/read-only
-        is_closed = current_session.get("status") == "ended"
-
         page.appbar = ft.AppBar(
             title=ft.Text(f"Administration: {current_session['name']}"),
         )
@@ -759,16 +688,14 @@ async def main(page: ft.Page):
         controls_panel = ft.Container(expand=2, padding=20, border=ft.Border(right=ft.BorderSide(1, ft.Colors.GREY_300)))
         public_link_panel = ft.Container(expand=2, padding=20)
 
-        def on_row_select(e, session_data):
-            logger.info("Admin selected session_id=%s name=%r", session_data[0], session_data[1])
-            # Update the global state with the selected session's data
-            current_session["id"] = session_data[0]
-            current_session["name"] = session_data[1]
-            current_session["code"] = session_data[5]
-            current_session["ask_email"] = bool(session_data[6])
-            current_session["ask_phone"] = bool(session_data[7])
-
-            # Rebuild the panels to reflect the newly selected session
+        def on_row_select(e, session_data: Session):
+            logger.info("Admin selected session_id=%s name=%r", session_data.id, session_data.name)
+            current_session["id"] = session_data.id
+            current_session["name"] = session_data.name
+            current_session["code"] = session_data.code
+            current_session["ask_email"] = bool(session_data.ask_email)
+            current_session["ask_phone"] = bool(session_data.ask_phone)
+            current_session["status"] = session_data.status
             build_panels()
             page.update()
 
@@ -777,22 +704,19 @@ async def main(page: ft.Page):
             logger.debug("Building admin panels with %s sessions", len(sessions))
             session_url = build_session_url(page, current_session["name"])
             session_url_qr_src = qr_image_src(session_url, box_size=8)
+            is_closed = current_session.get("status") == "ended"
 
-            # --- BUILD LEFT PANEL (Session List) ---
             list_tiles: list[ft.Control] = []
             for s in sessions:
-                sid, sname, sstart, sexpiry, sactive, scode, sask_email, sask_phone = s
-                is_expired = datetime.now() > datetime.fromisoformat(sexpiry)
-
                 # Visually distinguish active vs. expired sessions
-                icon = ft.Icons.CHECK_CIRCLE if not is_expired else ft.Icons.CANCEL
-                icon_color = ft.Colors.GREEN if not is_expired else ft.Colors.GREY
+                icon = ft.Icons.CHECK_CIRCLE if not s.is_expired else ft.Icons.CANCEL
+                icon_color = ft.Colors.GREEN if not s.is_expired else ft.Colors.GREY
 
                 tile = ft.ListTile(
                     leading=ft.Icon(icon, color=icon_color),
-                    title=ft.Text(sname, weight=ft.FontWeight.BOLD),
-                    subtitle=ft.Text(f"Starts: {sstart[:16]}\nExpires: {sexpiry[:16]}"),
-                    selected=(sid == current_session["id"]),
+                    title=ft.Text(s.name, weight=ft.FontWeight.BOLD),
+                    subtitle=ft.Text(f"Starts: {s.start[:16]}\nExpires: {s.expiry[:16]}"),
+                    selected=(s.id == current_session["id"]),
                     on_click=lambda e, data=s: on_row_select(e, data)
                 )
                 list_tiles.append(tile)
@@ -857,7 +781,7 @@ async def main(page: ft.Page):
                 logger.info("Switching to main app session_id=%s", current_session["id"])
                 current_session["ask_email"] = email_checkbox.value
                 current_session["ask_phone"] = phone_checkbox.value
-                save_session_settings(current_session["id"], email_checkbox.value, phone_checkbox.value)
+                session_repo.update_settings(current_session["id"], email_checkbox.value, phone_checkbox.value)
                 show_main_view()
 
             to_app_button = ft.Button("To the App...", on_click=on_to_app, disabled=is_closed)
