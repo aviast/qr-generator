@@ -28,7 +28,7 @@ jobs:
         uses: google-github-actions/deploy-cloudrun@v2
         with:
           service: qr-generator
-          image: us-west1-docker.pkg.dev/qr-generator-497801/ghcr-proxy/aviast/qr-generator:latest
+          image: us-west1-docker.pkg.dev/qr-generator-497801/ghcr-proxy/aviast/qr-generator:${{ github.sha }}
           region: us-west1
           flags: |
             --allow-unauthenticated
