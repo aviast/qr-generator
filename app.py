@@ -15,7 +15,6 @@ import threading
 import time
 import random
 import smtplib
-import sqlite3
 import urllib.parse
 import uuid
 from email.message import EmailMessage
@@ -23,6 +22,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast, Optional
 
+import database as db
 from models import Entry, Session
 from repository import DailyLimitRepository, EntryRepository, PreloadedNameRepository, SessionRepository
 
@@ -62,54 +62,14 @@ DB_PATH = os.path.join(STORAGE_DIR, "headshots.db")
 # A global lock to prevent SQLite database locking errors under concurrent load
 db_lock = threading.Lock()
 
+logger.info("Initializing database at %s", DB_PATH)
+db.initialize_database(DB_PATH, db_lock)
+logger.info("Database initialization complete")
+
 session_repo = SessionRepository(DB_PATH, db_lock)
 limit_repo = DailyLimitRepository(DB_PATH, db_lock)
 entry_repo = EntryRepository(DB_PATH, db_lock)
 name_repo = PreloadedNameRepository(DB_PATH, db_lock)
-
-def init_db():
-    logger.info("Initializing database at %s", DB_PATH)
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute('''CREATE TABLE IF NOT EXISTS sessions (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            name TEXT,
-                            email TEXT,
-                            source_ip TEXT,
-                            code TEXT,
-                            start TEXT,
-                            expiry TEXT,
-                            active INTEGER,
-                            status TEXT,
-                            ask_email INTEGER DEFAULT 0,
-                            ask_phone INTEGER DEFAULT 0
-                        )''')
-            c.execute('''CREATE TABLE IF NOT EXISTS entries (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            session_id INTEGER,
-                            timestamp TEXT,
-                            subject_name TEXT,
-                            email TEXT,
-                            phone TEXT,
-                            ip_address TEXT,
-                            device_id TEXT
-                        )''')
-            c.execute('''CREATE TABLE IF NOT EXISTS preloaded_names (
-                            session_id INTEGER,
-                            name TEXT
-                        )''')
-            c.execute('''CREATE TABLE IF NOT EXISTS daily_limits (
-                            limit_type TEXT,
-                            key_value TEXT,
-                            date TEXT,
-                            count INTEGER,
-                            PRIMARY KEY(limit_type, key_value, date)
-                        )''')
-            conn.commit()
-    logger.info("Database initialization complete")
-
-init_db()
 
 # --- Helper Functions ---
 def generate_code():

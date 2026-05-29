@@ -1,0 +1,47 @@
+name: Deploy to Cloud Run
+
+on:
+  workflow_run:
+    workflows: ["Build and Publish Docker Image"]
+    types:
+      - completed
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy to Cloud Run
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: qr-generator
+          image: ghcr.io/aviast/qr-generator:latest
+          region: us-west1
+          flags: |
+            --allow-unauthenticated
+            --max-instances=1
+            --memory=512Mi
+          env_vars: |
+            FLET_APP_STORAGE_DATA=/data
+            SMTP_HOST=smtp.gmail.com
+            SMTP_PORT=587
+            SMTP_USER=michael.k.henry@gmail.com
+            FROM_EMAIL=michael.k.henry@gmail.com
+          secrets: |
+            SMTP_PASSWORD=SMTP_PASSWORD:latest
+
+      - name: Dynamically Inject Public Base URL
+        run: |
+          gcloud run services update qr-generator \
+            --region=us-west1 \
+            --update-env-vars=PUBLIC_BASE_URL="${{ steps.deploy.outputs.url }}/"
