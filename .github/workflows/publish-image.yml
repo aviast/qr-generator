@@ -40,6 +40,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=sha,prefix=
+            type=raw,value=${{ github.sha }}
             latest
 
       # Build and push Docker image
