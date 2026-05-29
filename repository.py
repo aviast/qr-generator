@@ -22,13 +22,12 @@ def _get_firestore_client() -> Any:
     """Initializes and returns the Firestore client using Application Default Credentials."""
     global _firestore_client_cache
     if _firestore_client_cache is None:
-        if firebase_admin is None:
-            raise ImportError("firebase-admin package is missing. Add it to your requirements.txt.")
-        if not firebase_admin._apps:
-            # Automatically discovers credentials injected by Cloud Run
-            cred = credentials.ApplicationDefault()
-            firebase_admin.initialize_app(cred)
-        _firestore_client_cache = firestore.client()
+        # Import the native Google Cloud Firestore client
+        from google.cloud import firestore
+
+        # Explicitly target the named database
+        _firestore_client_cache = firestore.Client(database='qr-generator')
+
     return _firestore_client_cache
 
 
