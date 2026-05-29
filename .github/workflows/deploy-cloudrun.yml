@@ -11,6 +11,9 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
 
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
     steps:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -25,7 +28,7 @@ jobs:
         uses: google-github-actions/deploy-cloudrun@v2
         with:
           service: qr-generator
-          image: ghcr.io/aviast/qr-generator:latest
+          image: us-west1-docker.pkg.dev/qr-generator-497801/ghcr-proxy/aviast/qr-generator:latest
           region: us-west1
           flags: |
             --allow-unauthenticated
