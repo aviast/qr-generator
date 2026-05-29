@@ -1,9 +1,78 @@
+import os
 import sqlite3
-from typing import List, Optional
+import threading
+from abc import ABC, abstractmethod
+from typing import List, Optional, Any, Dict
 from models import Session, Entry
 
-class SessionRepository:
-    def __init__(self, db_path: str, lock):
+# Try importing Firebase dependencies safely (only required when running on GCP)
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+    from google.cloud.firestore import Increment
+except ImportError:
+    firebase_admin = None
+    firestore = None
+    Increment = None
+
+# Global cache to reuse the Firestore client instance across repository instantiations
+_firestore_client_cache = None
+
+def _get_firestore_client() -> Any:
+    """Initializes and returns the Firestore client using Application Default Credentials."""
+    global _firestore_client_cache
+    if _firestore_client_cache is None:
+        if firebase_admin is None:
+            raise ImportError("firebase-admin package is missing. Add it to your requirements.txt.")
+        if not firebase_admin._apps:
+            # Automatically discovers credentials injected by Cloud Run
+            cred = credentials.ApplicationDefault()
+            firebase_admin.initialize_app(cred)
+        _firestore_client_cache = firestore.client()
+    return _firestore_client_cache
+
+
+# =====================================================================
+# 1. SESSION REPOSITORY
+# =====================================================================
+
+class SessionRepository(ABC):
+    """Abstract Base Class for Session management.
+    Acts as a transparent factory router using __new__."""
+
+    def __new__(cls, *args, **kwargs):
+        if cls is SessionRepository:
+            if os.environ.get("K_SERVICE"):
+                return super().__new__(FirestoreSessionRepository)
+            return super().__new__(SQLiteSessionRepository)
+        return super().__new__(cls)
+
+    @abstractmethod
+    def get_by_name(self, name: str) -> Optional[Session]: pass
+    @abstractmethod
+    def get_by_id(self, session_id: Any) -> Optional[Session]: pass
+    @abstractmethod
+    def get_all_by_email(self, email: str) -> List[Session]: pass
+    @abstractmethod
+    def create(self, session: Session) -> Optional[Any]: pass
+    @abstractmethod
+    def update_settings(self, session_id: Any, ask_email: bool, ask_phone: bool): pass
+    @abstractmethod
+    def end_session_status(self, session_id: Any, now_str: str): pass
+    @abstractmethod
+    def mark_as_active(self, session_id: Optional[Any]): pass
+    @abstractmethod
+    def mark_active_sessions_by_email(self, email: str, now: str) -> int: pass
+    @abstractmethod
+    def get_expired_active_ids(self, now: str) -> List[Any]: pass
+    @abstractmethod
+    def get_ended_ids_before(self, purge_cutoff: str) -> List[Any]: pass
+    @abstractmethod
+    def mark_as_deleted(self, session_id: Any): pass
+
+
+class SQLiteSessionRepository(SessionRepository):
+    def __init__(self, db_path: str, lock: threading.Lock):
         self.db_path = db_path
         self.lock = lock
 
@@ -18,11 +87,11 @@ class SessionRepository:
             row = c.fetchone()
             return self._row_to_model(row) if row else None
 
-    def get_by_id(self, session_id: int) -> Optional[Session]:
+    def get_by_id(self, session_id: Any) -> Optional[Session]:
         with self.lock, sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
-            c.execute("SELECT * FROM sessions WHERE id=?", (session_id,))
+            c.execute("SELECT * FROM sessions WHERE id=?", (int(session_id),))
             row = c.fetchone()
             return self._row_to_model(row) if row else None
 
@@ -33,7 +102,7 @@ class SessionRepository:
             c.execute("SELECT * FROM sessions WHERE email=? ORDER BY start DESC", (email,))
             return [self._row_to_model(row) for row in c.fetchall()]
 
-    def create(self, session: Session) -> Optional[int]:
+    def create(self, session: Session) -> Optional[Any]:
         with self.lock, sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
             c.execute('''INSERT INTO sessions (name, email, source_ip, code, start, expiry, active, status, ask_email, ask_phone)
@@ -44,24 +113,24 @@ class SessionRepository:
             conn.commit()
             return c.lastrowid
 
-    def update_settings(self, session_id: int, ask_email: bool, ask_phone: bool):
+    def update_settings(self, session_id: Any, ask_email: bool, ask_phone: bool):
         with self.lock, sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
-            c.execute("UPDATE sessions SET ask_email=?, ask_phone=? WHERE id=?", (int(ask_email), int(ask_phone), session_id))
+            c.execute("UPDATE sessions SET ask_email=?, ask_phone=? WHERE id=?", (int(ask_email), int(ask_phone), int(session_id)))
             conn.commit()
 
-    def end_session_status(self, session_id: int, now_str: str):
+    def end_session_status(self, session_id: Any, now_str: str):
         with self.lock, sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
-            c.execute("UPDATE sessions SET status='ended', active=0, expiry=? WHERE id=?", (now_str, session_id))
+            c.execute("UPDATE sessions SET status='ended', active=0, expiry=? WHERE id=?", (now_str, int(session_id)))
             conn.commit()
 
-    def mark_as_active(self, session_id: Optional[int]):
+    def mark_as_active(self, session_id: Optional[Any]):
         if session_id is None:
             return
         with self.lock, sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
-            c.execute("UPDATE sessions SET active=1 WHERE id=?", (session_id,))
+            c.execute("UPDATE sessions SET active=1 WHERE id=?", (int(session_id),))
             conn.commit()
 
     def mark_active_sessions_by_email(self, email: str, now: str) -> int:
@@ -74,76 +143,254 @@ class SessionRepository:
             conn.commit()
             return c.rowcount
 
-    def get_expired_active_ids(self, now: str) -> List[int]:
+    def get_expired_active_ids(self, now: str) -> List[Any]:
         with self.lock, sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
             c.execute("SELECT id FROM sessions WHERE active=1 AND expiry<?", (now,))
             return [row[0] for row in c.fetchall()]
 
-    def get_ended_ids_before(self, purge_cutoff: str) -> List[int]:
+    def get_ended_ids_before(self, purge_cutoff: str) -> List[Any]:
         with self.lock, sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
             c.execute("SELECT id FROM sessions WHERE status='ended' AND expiry<?", (purge_cutoff,))
             return [row[0] for row in c.fetchall()]
 
-    def mark_as_deleted(self, session_id: int):
+    def mark_as_deleted(self, session_id: Any):
         with self.lock, sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
-            c.execute("UPDATE sessions SET status='deleted' WHERE id=?", (session_id,))
+            c.execute("UPDATE sessions SET status='deleted' WHERE id=?", (int(session_id),))
             conn.commit()
 
 
-class EntryRepository:
-    def __init__(self, db_path: str, lock):
+class FirestoreSessionRepository(SessionRepository):
+    def __init__(self, *args, **kwargs):
+        # Gracefully swallows db_path and lock signatures from local configuration
+        self.db = _get_firestore_client()
+        self.collection = self.db.collection('sessions')
+
+    def _doc_to_model(self, doc) -> Session:
+        data = doc.to_dict()
+        data['id'] = doc.id # Maps Firestore string hash identifier to the model ID
+        return Session(**data)
+
+    def get_by_name(self, name: str) -> Optional[Session]:
+        docs = self.collection.where('name', '==', name).stream()
+        for doc in docs:
+            model = self._doc_to_model(doc)
+            if model.status != 'deleted': # In-memory evaluation prevents index requirement
+                return model
+        return None
+
+    def get_by_id(self, session_id: Any) -> Optional[Session]:
+        doc = self.collection.document(str(session_id)).get()
+        return self._doc_to_model(doc) if doc.exists else None
+
+    def get_all_by_email(self, email: str) -> List[Session]:
+        docs = self.collection.where('email', '==', email).stream()
+        sessions = [self._doc_to_model(doc) for doc in docs]
+        sessions.sort(key=lambda x: x.start if x.start else "", reverse=True)
+        return sessions
+
+    def create(self, session: Session) -> Optional[Any]:
+        data = {
+            "name": session.name,
+            "email": session.email,
+            "source_ip": session.source_ip,
+            "code": session.code,
+            "start": session.start,
+            "expiry": session.expiry,
+            "active": int(session.active),
+            "status": session.status,
+            "ask_email": int(session.ask_email),
+            "ask_phone": int(session.ask_phone)
+        }
+        doc_ref = self.collection.document()
+        doc_ref.set(data)
+        return doc_ref.id
+
+    def update_settings(self, session_id: Any, ask_email: bool, ask_phone: bool):
+        self.collection.document(str(session_id)).update({
+            "ask_email": int(ask_email),
+            "ask_phone": int(ask_phone)
+        })
+
+    def end_session_status(self, session_id: Any, now_str: str):
+        self.collection.document(str(session_id)).update({
+            "status": 'ended',
+            "active": 0,
+            "expiry": now_str
+        })
+
+    def mark_as_active(self, session_id: Optional[Any]):
+        if session_id is None:
+            return
+        self.collection.document(str(session_id)).update({"active": 1})
+
+    def mark_active_sessions_by_email(self, email: str, now: str) -> int:
+        docs = self.collection.where('email', '==', email).stream()
+        batch = self.db.batch()
+        count = 0
+        for doc in docs:
+            model = self._doc_to_model(doc)
+            if model.status == 'active' and model.expiry >= now:
+                batch.update(doc.reference, {"active": 1})
+                count += 1
+        if count > 0:
+            batch.commit()
+        return count
+
+    def get_expired_active_ids(self, now: str) -> List[Any]:
+        docs = self.collection.where('active', '==', 1).stream()
+        return [doc.id for doc in docs if doc.to_dict().get('expiry', '') < now]
+
+    def get_ended_ids_before(self, purge_cutoff: str) -> List[Any]:
+        docs = self.collection.where('status', '==', 'ended').stream()
+        return [doc.id for doc in docs if doc.to_dict().get('expiry', '') < purge_cutoff]
+
+    def mark_as_deleted(self, session_id: Any):
+        self.collection.document(str(session_id)).update({"status": 'deleted'})
+
+
+# =====================================================================
+# 2. ENTRY REPOSITORY
+# =====================================================================
+
+class EntryRepository(ABC):
+    """Abstract Base Class for Entry tracking."""
+
+    def __new__(cls, *args, **kwargs):
+        if cls is EntryRepository:
+            if os.environ.get("K_SERVICE"):
+                return super().__new__(FirestoreEntryRepository)
+            return super().__new__(SQLiteEntryRepository)
+        return super().__new__(cls)
+
+    @abstractmethod
+    def get_by_session_id(self, session_id: Any) -> List[Entry]: pass
+    @abstractmethod
+    def count_by_session_id(self, session_id: Any) -> int: pass
+    @abstractmethod
+    def create(self, entry: Entry) -> Optional[Any]: pass
+    @abstractmethod
+    def delete_by_session_id(self, session_id: Any): pass
+
+
+class SQLiteEntryRepository(EntryRepository):
+    def __init__(self, db_path: str, lock: threading.Lock):
         self.db_path = db_path
         self.lock = lock
 
     def _row_to_model(self, row: sqlite3.Row) -> Entry:
         return Entry(**dict(row))
 
-    def get_by_session_id(self, session_id: int) -> List[Entry]:
-        """Fetches all entries for a session, ordered chronologically (ideal for CSVs)."""
+    def get_by_session_id(self, session_id: Any) -> List[Entry]:
         with self.lock, sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
-            c.execute('''SELECT * FROM entries
-                         WHERE session_id=? ORDER BY timestamp ASC''', (session_id,))
+            c.execute('''SELECT * FROM entries WHERE session_id=? ORDER BY timestamp ASC''', (int(session_id),))
             return [self._row_to_model(row) for row in c.fetchall()]
 
-    def count_by_session_id(self, session_id: int) -> int:
+    def count_by_session_id(self, session_id: Any) -> int:
         with self.lock, sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM entries WHERE session_id=?", (session_id,))
+            c.execute("SELECT COUNT(*) FROM entries WHERE session_id=?", (int(session_id),))
             return c.fetchone()[0]
 
-    def create(self, entry: Entry) -> Optional[int]:
+    def create(self, entry: Entry) -> Optional[Any]:
         with self.lock, sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
             c.execute('''INSERT INTO entries (session_id, timestamp, subject_name, email, phone, ip_address, device_id)
                          VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                      (entry.session_id, entry.timestamp, entry.subject_name, entry.email,
+                      (int(entry.session_id), entry.timestamp, entry.subject_name, entry.email,
                        entry.phone, entry.ip_address, entry.device_id))
             conn.commit()
             return c.lastrowid
 
-    def delete_by_session_id(self, session_id: int):
-        """Used by the privacy worker to permanently purge data."""
+    def delete_by_session_id(self, session_id: Any):
         with self.lock, sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
-            c.execute("DELETE FROM entries WHERE session_id=?", (session_id,))
+            c.execute("DELETE FROM entries WHERE session_id=?", (int(session_id),))
             conn.commit()
 
 
-class DailyLimitRepository:
-    def __init__(self, db_path: str, lock):
+class FirestoreEntryRepository(EntryRepository):
+    def __init__(self, *args, **kwargs):
+        self.db = _get_firestore_client()
+
+    def _doc_to_model(self, doc, session_id: str) -> Entry:
+        data = doc.to_dict()
+        data['id'] = doc.id
+        data['session_id'] = session_id
+        return Entry(**data)
+
+    def _get_subcollection(self, session_id: Any):
+        return self.db.collection('sessions').document(str(session_id)).collection('entries')
+
+    def get_by_session_id(self, session_id: Any) -> List[Entry]:
+        docs = self._get_subcollection(session_id).stream()
+        entries = [self._doc_to_model(doc, str(session_id)) for doc in docs]
+        entries.sort(key=lambda x: x.timestamp if x.timestamp else "")
+        return entries
+
+    def count_by_session_id(self, session_id: Any) -> int:
+        # Optimized cloud-native aggregation query
+        alias_count = self._get_subcollection(session_id).count()
+        results = alias_count.get()
+        return results[0][0].value
+
+    def create(self, entry: Entry) -> Optional[Any]:
+        data = {
+            "session_id": str(entry.session_id),
+            "timestamp": entry.timestamp,
+            "subject_name": entry.subject_name,
+            "email": entry.email,
+            "phone": entry.phone,
+            "ip_address": entry.ip_address,
+            "device_id": entry.device_id
+        }
+        doc_ref = self._get_subcollection(entry.session_id).document()
+        doc_ref.set(data)
+        return doc_ref.id
+
+    def delete_by_session_id(self, session_id: Any):
+        docs = self._get_subcollection(session_id).stream()
+        batch = self.db.batch()
+        for doc in docs:
+            batch.delete(doc.reference)
+        batch.commit()
+
+
+# =====================================================================
+# 3. DAILY LIMIT REPOSITORY
+# =====================================================================
+
+class DailyLimitRepository(ABC):
+    """Abstract Base Class for Rate Limiting."""
+
+    def __new__(cls, *args, **kwargs):
+        if cls is DailyLimitRepository:
+            if os.environ.get("K_SERVICE"):
+                return super().__new__(FirestoreDailyLimitRepository)
+            return super().__new__(SQLiteDailyLimitRepository)
+        return super().__new__(cls)
+
+    @abstractmethod
+    def get_count(self, limit_type: str, key_value: str, target_date: str) -> int: pass
+    @abstractmethod
+    def increment(self, limit_type: str, key_value: str, target_date: str): pass
+    @abstractmethod
+    def delete_old_limits(self, current_date: str) -> int: pass
+
+
+class SQLiteDailyLimitRepository(DailyLimitRepository):
+    def __init__(self, db_path: str, lock: threading.Lock):
         self.db_path = db_path
         self.lock = lock
 
     def get_count(self, limit_type: str, key_value: str, target_date: str) -> int:
         with self.lock, sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
-            c.execute('''SELECT count FROM daily_limits
-                         WHERE limit_type=? AND key_value=? AND date=?''',
+            c.execute('''SELECT count FROM daily_limits WHERE limit_type=? AND key_value=? AND date=?''',
                       (limit_type, key_value, target_date))
             row = c.fetchone()
             return row[0] if row else 0
@@ -166,29 +413,131 @@ class DailyLimitRepository:
             return c.rowcount
 
 
-class PreloadedNameRepository:
-    def __init__(self, db_path: str, lock):
+class FirestoreDailyLimitRepository(DailyLimitRepository):
+    def __init__(self, *args, **kwargs):
+        self.db = _get_firestore_client()
+        self.collection = self.db.collection('daily_limits')
+
+    def _make_doc_id(self, limit_type: str, key_value: str, target_date: str) -> str:
+        # Generates a clean composite document ID to bypass scanning filters
+        return f"{limit_type}_{key_value}_{target_date}"
+
+    def get_count(self, limit_type: str, key_value: str, target_date: str) -> int:
+        doc_id = self._make_doc_id(limit_type, key_value, target_date)
+        doc = self.collection.document(doc_id).get()
+        return doc.to_dict().get('count', 0) if doc.exists else 0
+
+    def increment(self, limit_type: str, key_value: str, target_date: str):
+        doc_id = self._make_doc_id(limit_type, key_value, target_date)
+        self.collection.document(doc_id).set({
+            "limit_type": limit_type,
+            "key_value": key_value,
+            "date": target_date,
+            "count": Increment(1) # Atomic cloud counter prevents multi-thread race conditions
+        }, merge=True)
+
+    def delete_old_limits(self, current_date: str) -> int:
+        # Use a filter to only stream documents older than today, saving massive read costs
+        docs = self.collection.where('date', '<', current_date).stream()
+        batch = self.db.batch()
+        count = 0
+        for doc in docs:
+            batch.delete(doc.reference)
+            count += 1
+            if count % 500 == 0:
+                batch.commit()
+                batch = self.db.batch()
+        if count % 500 != 0:
+            batch.commit()
+        return count
+
+
+# =====================================================================
+# 4. PRELOADED NAME REPOSITORY
+# =====================================================================
+
+class PreloadedNameRepository(ABC):
+    """Abstract Base Class for Autocomplete Preloaded Names."""
+
+    def __new__(cls, *args, **kwargs):
+        if cls is PreloadedNameRepository:
+            if os.environ.get("K_SERVICE"):
+                return super().__new__(FirestorePreloadedNameRepository)
+            return super().__new__(SQLitePreloadedNameRepository)
+        return super().__new__(cls)
+
+    @abstractmethod
+    def replace_for_session(self, session_id: Any, names: List[str]): pass
+    @abstractmethod
+    def find_matches(self, session_id: Any, prefix: str, limit: int) -> List[str]: pass
+    @abstractmethod
+    def delete_by_session_id(self, session_id: Any): pass
+
+
+class SQLitePreloadedNameRepository(PreloadedNameRepository):
+    def __init__(self, db_path: str, lock: threading.Lock):
         self.db_path = db_path
         self.lock = lock
 
-    def replace_for_session(self, session_id: int, names: List[str]):
+    def replace_for_session(self, session_id: Any, names: List[str]):
         with self.lock, sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
-            c.execute("DELETE FROM preloaded_names WHERE session_id=?", (session_id,))
+            c.execute("DELETE FROM preloaded_names WHERE session_id=?", (int(session_id),))
             c.executemany("INSERT INTO preloaded_names (session_id, name) VALUES (?, ?)",
-                          [(session_id, n) for n in names])
+                          [(int(session_id), n) for n in names])
             conn.commit()
 
-    def find_matches(self, session_id: int, prefix: str, limit: int) -> List[str]:
+    def find_matches(self, session_id: Any, prefix: str, limit: int) -> List[str]:
         with self.lock, sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
             c.execute("SELECT name FROM preloaded_names WHERE session_id=? AND name LIKE ? LIMIT ?",
-                      (session_id, prefix + '%', limit))
+                      (int(session_id), prefix + '%', limit))
             return [row[0] for row in c.fetchall()]
 
-    def delete_by_session_id(self, session_id: int):
-        """Used by the privacy worker to permanently purge data."""
+    def delete_by_session_id(self, session_id: Any):
         with self.lock, sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
-            c.execute("DELETE FROM preloaded_names WHERE session_id=?", (session_id,))
+            c.execute("DELETE FROM preloaded_names WHERE session_id=?", (int(session_id),))
             conn.commit()
+
+
+class FirestorePreloadedNameRepository(PreloadedNameRepository):
+    def __init__(self, *args, **kwargs):
+        self.db = _get_firestore_client()
+
+    def _get_subcollection(self, session_id: Any):
+        return self.db.collection('sessions').document(str(session_id)).collection('preloaded_names')
+
+    def replace_for_session(self, session_id: Any, names: List[str]):
+        sub_coll = self._get_subcollection(session_id)
+
+        # Purge current entries
+        docs = sub_coll.stream()
+        batch = self.db.batch()
+        for doc in docs:
+            batch.delete(doc.reference)
+        batch.commit()
+
+        # Stream entries in chunks of 500
+        batch = self.db.batch()
+        for i, name in enumerate(names):
+            doc_ref = sub_coll.document()
+            batch.set(doc_ref, {"name": name})
+            if (i + 1) % 500 == 0:
+                batch.commit()
+                batch = self.db.batch()
+        if len(names) % 500 != 0:
+            batch.commit()
+
+    def find_matches(self, session_id: Any, prefix: str, limit: int) -> List[str]:
+        sub_coll = self._get_subcollection(session_id)
+        # Cloud prefix pattern match uses high-range unicode trailing string filters
+        query = sub_coll.where('name', '>=', prefix).where('name', '<=', prefix + '\uf8ff').limit(limit)
+        return [doc.to_dict()['name'] for doc in query.stream()]
+
+    def delete_by_session_id(self, session_id: Any):
+        docs = self._get_subcollection(session_id).stream()
+        batch = self.db.batch()
+        for doc in docs:
+            batch.delete(doc.reference)
+        batch.commit()

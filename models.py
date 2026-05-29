@@ -1,10 +1,10 @@
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Union
 
 @dataclass
 class Session:
-    id: Optional[int]
+    id: Optional[Union[int, str]] # Updated to handle both SQL and Firestore IDs
     name: str
     email: str
     source_ip: str
@@ -23,8 +23,8 @@ class Session:
 
 @dataclass
 class Entry:
-    id: Optional[int]
-    session_id: int
+    id: Optional[Union[int, str]]
+    session_id: Union[int, str]
     timestamp: str
     subject_name: str
     email: str

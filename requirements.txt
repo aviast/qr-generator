@@ -1,2 +1,4 @@
 flet[web]
 qrcode[pil]
+firebase-admin
+google-cloud-firestore

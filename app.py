@@ -62,8 +62,12 @@ DB_PATH = os.path.join(STORAGE_DIR, "headshots.db")
 # A global lock to prevent SQLite database locking errors under concurrent load
 db_lock = threading.Lock()
 
-logger.info("Initializing database at %s", DB_PATH)
-db.initialize_database(DB_PATH, db_lock)
+if not os.environ.get("K_SERVICE"):
+    logger.info("Initializing local SQLite database at %s", DB_PATH)
+    db.initialize_database(DB_PATH, db_lock)
+else:
+    logger.info("Cloud Run detected. Bypassing SQLite initialization.")
+
 logger.info("Database initialization complete")
 
 session_repo = SessionRepository(DB_PATH, db_lock)
@@ -412,7 +416,7 @@ def expiry_worker():
             entry_repo.delete_by_session_id(sid)
             name_repo.delete_by_session_id(sid)
 
-        time.sleep(60)
+        time.sleep(3600)
 
 # --- Flet UI Main ---
 async def main(page: ft.Page):
