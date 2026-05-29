@@ -12,7 +12,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py models.py repository.py .
+COPY app.py models.py repository.py database.py .
 COPY Roboto ./Roboto
 
 RUN groupadd --gid "${APP_GID}" app \
