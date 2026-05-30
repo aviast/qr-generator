@@ -22,11 +22,18 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast, Optional
 
-import database as db
 from models import Entry, Session
-from repository import DailyLimitRepository, EntryRepository, PreloadedNameRepository, SessionRepository
+from repository import (
+    DailyLimitRepository,
+    EntryRepository,
+    PreloadedNameRepository,
+    SessionRepository,
+    get_repository_factory
+)
 
 # --- Configuration & Environment ---
+APP_HOST = "localhost"
+APP_PORT = 8080
 SMTP_HOST = os.environ.get("SMTP_HOST")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER")
@@ -53,27 +60,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Database Initialization ---
-STORAGE_DIR = os.environ.get("FLET_APP_STORAGE_DATA", ".")
-if not os.path.exists(STORAGE_DIR):
-    os.makedirs(STORAGE_DIR, exist_ok=True)
-DB_PATH = os.path.join(STORAGE_DIR, "headshots.db")
+logger.info("Connecting to storage layer...")
+repository_factory = get_repository_factory()
 
-# A global lock to prevent SQLite database locking errors under concurrent load
-db_lock = threading.Lock()
-
-if not os.environ.get("K_SERVICE"):
-    logger.info("Initializing local SQLite database at %s", DB_PATH)
-    db.initialize_database(DB_PATH, db_lock)
-else:
-    logger.info("Cloud Run detected. Bypassing SQLite initialization.")
-
-logger.info("Database initialization complete")
-
-session_repo = SessionRepository(DB_PATH, db_lock)
-limit_repo = DailyLimitRepository(DB_PATH, db_lock)
-entry_repo = EntryRepository(DB_PATH, db_lock)
-name_repo = PreloadedNameRepository(DB_PATH, db_lock)
+session_repo = repository_factory(SessionRepository)
+limit_repo = repository_factory(DailyLimitRepository)
+entry_repo = repository_factory(EntryRepository)
+name_repo = repository_factory(PreloadedNameRepository)
+logger.info("Storage layer connected successfully.")
 
 # --- Helper Functions ---
 def generate_code():
@@ -103,14 +97,14 @@ def get_client_ip(page: ft.Page):
     return (getattr(page, "client_ip", None) or UNKNOWN_IP_KEY).strip() or UNKNOWN_IP_KEY
 
 def build_session_url(page: ft.Page, session_name: str):
-    base_url = PUBLIC_BASE_URL or getattr(page, "url", None) or "http://localhost:8080/"
+    base_url = PUBLIC_BASE_URL or getattr(page, "url", None) or f"http://{APP_HOST}:{APP_PORT}/"
     parsed = urllib.parse.urlparse(base_url)
     if parsed.scheme == "ws":
         parsed = parsed._replace(scheme="http")
     elif parsed.scheme == "wss":
         parsed = parsed._replace(scheme="https")
     if not parsed.scheme or not parsed.netloc:
-        parsed = urllib.parse.urlparse("http://localhost:8080/")
+        parsed = urllib.parse.urlparse(f"http://{APP_HOST}:{APP_PORT}/")
 
     path = parsed.path or "/"
     query = urllib.parse.urlencode({"session": session_name})
@@ -1071,5 +1065,5 @@ if __name__ == "__main__":
     logger.info("Starting application")
     t = threading.Thread(target=expiry_worker, daemon=True)
     t.start()
-    logger.info("Starting Flet server on 0.0.0.0:8080")
-    ft.run(main=main, view=ft.AppView.WEB_BROWSER, host="0.0.0.0", port=8080, assets_dir="Roboto")
+    logger.info(f"Starting Flet server on 0.0.0.0:{APP_PORT}")
+    ft.run(main=main, view=ft.AppView.WEB_BROWSER, host="0.0.0.0", port=APP_PORT, assets_dir="Roboto")

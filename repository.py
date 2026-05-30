@@ -36,15 +36,9 @@ def _get_firestore_client() -> Any:
 # =====================================================================
 
 class SessionRepository(ABC):
-    """Abstract Base Class for Session management.
-    Acts as a transparent factory router using __new__."""
-
-    def __new__(cls, *args, **kwargs):
-        if cls is SessionRepository:
-            if os.environ.get("K_SERVICE"):
-                return super().__new__(FirestoreSessionRepository)
-            return super().__new__(SQLiteSessionRepository)
-        return super().__new__(cls)
+    """
+    Abstract Base Class for Session management.
+    """
 
     @abstractmethod
     def get_by_name(self, name: str) -> Optional[Session]: pass
@@ -257,13 +251,6 @@ class FirestoreSessionRepository(SessionRepository):
 class EntryRepository(ABC):
     """Abstract Base Class for Entry tracking."""
 
-    def __new__(cls, *args, **kwargs):
-        if cls is EntryRepository:
-            if os.environ.get("K_SERVICE"):
-                return super().__new__(FirestoreEntryRepository)
-            return super().__new__(SQLiteEntryRepository)
-        return super().__new__(cls)
-
     @abstractmethod
     def get_by_session_id(self, session_id: Any) -> List[Entry]: pass
     @abstractmethod
@@ -366,13 +353,6 @@ class FirestoreEntryRepository(EntryRepository):
 class DailyLimitRepository(ABC):
     """Abstract Base Class for Rate Limiting."""
 
-    def __new__(cls, *args, **kwargs):
-        if cls is DailyLimitRepository:
-            if os.environ.get("K_SERVICE"):
-                return super().__new__(FirestoreDailyLimitRepository)
-            return super().__new__(SQLiteDailyLimitRepository)
-        return super().__new__(cls)
-
     @abstractmethod
     def get_count(self, limit_type: str, key_value: str, target_date: str) -> int: pass
     @abstractmethod
@@ -458,13 +438,6 @@ class FirestoreDailyLimitRepository(DailyLimitRepository):
 class PreloadedNameRepository(ABC):
     """Abstract Base Class for Autocomplete Preloaded Names."""
 
-    def __new__(cls, *args, **kwargs):
-        if cls is PreloadedNameRepository:
-            if os.environ.get("K_SERVICE"):
-                return super().__new__(FirestorePreloadedNameRepository)
-            return super().__new__(SQLitePreloadedNameRepository)
-        return super().__new__(cls)
-
     @abstractmethod
     def replace_for_session(self, session_id: Any, names: List[str]): pass
     @abstractmethod
@@ -540,3 +513,89 @@ class FirestorePreloadedNameRepository(PreloadedNameRepository):
         for doc in docs:
             batch.delete(doc.reference)
         batch.commit()
+
+### Global functions
+
+def _initialize_database(db_path: str, lock):
+    """Initializes the database schema. Should be called once at application startup."""
+
+    with lock, sqlite3.connect(db_path) as conn:
+        c = conn.cursor()
+
+        c.execute('''CREATE TABLE IF NOT EXISTS sessions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT,
+                        email TEXT,
+                        source_ip TEXT,
+                        code TEXT,
+                        start TEXT,
+                        expiry TEXT,
+                        active INTEGER,
+                        status TEXT,
+                        ask_email INTEGER DEFAULT 0,
+                        ask_phone INTEGER DEFAULT 0
+                    )''')
+
+        c.execute('''CREATE TABLE IF NOT EXISTS entries (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id INTEGER,
+                        timestamp TEXT,
+                        subject_name TEXT,
+                        email TEXT,
+                        phone TEXT,
+                        ip_address TEXT,
+                        device_id TEXT
+                    )''')
+
+        c.execute('''CREATE TABLE IF NOT EXISTS preloaded_names (
+                        session_id INTEGER,
+                        name TEXT
+                    )''')
+
+        c.execute('''CREATE TABLE IF NOT EXISTS daily_limits (
+                        limit_type TEXT,
+                        key_value TEXT,
+                        date TEXT,
+                        count INTEGER,
+                        PRIMARY KEY(limit_type, key_value, date)
+                    )''')
+        conn.commit()
+
+def get_repository_factory():
+    """
+    Initializes necessary storage and returns a factory function
+    that generates the correct repository implementation.
+    """
+    is_cloud = bool(os.environ.get("K_SERVICE"))
+    # A global lock to prevent SQLite database locking errors under concurrent load
+    lock = threading.Lock()
+
+    STORAGE_DIR = os.environ.get("FLET_APP_STORAGE_DATA", ".")
+    if not os.path.exists(STORAGE_DIR):
+        os.makedirs(STORAGE_DIR, exist_ok=True)
+    DB_PATH = os.path.join(STORAGE_DIR, "headshots.db")
+
+    # Silently handle the infrastructure setup before returning the factory
+    if not is_cloud:
+        # We only initialize the SQLite file if we aren't in the cloud
+        _initialize_database(DB_PATH, lock)
+
+    def factory(repo_class):
+        if is_cloud:
+            mapping = {
+                SessionRepository: FirestoreSessionRepository,
+                EntryRepository: FirestoreEntryRepository,
+                DailyLimitRepository: FirestoreDailyLimitRepository,
+                PreloadedNameRepository: FirestorePreloadedNameRepository
+            }
+            return mapping[repo_class]()
+        else:
+            mapping = {
+                SessionRepository: SQLiteSessionRepository,
+                EntryRepository: SQLiteEntryRepository,
+                DailyLimitRepository: SQLiteDailyLimitRepository,
+                PreloadedNameRepository: SQLitePreloadedNameRepository
+            }
+            return mapping[repo_class](DB_PATH, lock)
+
+    return factory
